@@ -97,9 +97,15 @@ RenderTrackedHands(void)
 	if(!::gVrFirstPersonActive)
 		return;
 	// A dead Tommy is drawn with his own arms, and the tracked pair would
-	// be left floating over the body he is lying in.
+	// be left floating over the body he is lying in. A cutscene is the
+	// same case: the actors have their own arms, and the stereo cutscene
+	// modes run through the first-person path that draws these. So is a
+	// scripted scene the camera is watching from inside an actor: that
+	// one is not a cutscene at all, only a camera parked on a head.
 	CPlayerPed *player = FindPlayerPed();
-	if(player == nil || player->DyingOrDead())
+	if(player == nil || player->DyingOrDead() ||
+	   CCutsceneMgr::IsRunning() || CCutsceneMgr::IsCutsceneProcessing() ||
+	   androidgame::VrCutsceneCameraActor() != nil)
 		return;
 
 	const PadInput &input = GetPadInput();

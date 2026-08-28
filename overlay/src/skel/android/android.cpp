@@ -30,6 +30,11 @@
 #include "PlayerInfo.h"
 #include "PlayerPed.h"
 #include "CutsceneMgr.h"
+#include "CutsceneObject.h"
+#include "RpAnimBlend.h"
+#include "AnimBlendClumpData.h"
+#include "Bones.h"
+#include "ModelIndices.h"
 #include "Vehicle.h"
 #include "World.h"
 #include "Draw.h"
@@ -555,6 +560,17 @@ androidgame::VrShouldUseTheaterMode(void)
 	// world between opening scenes.  That interval has no valid immersive
 	// camera or world to display, so it belongs to the same static theater
 	// path instead of exposing the clear-colour sky for one or more frames.
+	// A cutscene has a camera of its own, and in stereo that camera is
+	// simply the view: the shot keeps its framing and gains depth, and
+	// the player can look around inside it. CINEMA is still the default
+	// and still puts the same camera on the flat screen. The letterbox
+	// flag rides along with the cutscene and was forcing the flat screen
+	// by itself, so both belong to the same choice.
+	const bool cinematic = androidgame::VrCutsceneMode() != 0;
+	const bool cutsceneOnScreen = !cinematic &&
+		(CCutsceneMgr::IsCutsceneProcessing() ||
+		 CCutsceneMgr::IsRunning() ||
+		 TheCamera.m_WideScreenOn);
 	return gGameState != GS_PLAYING_GAME ||
 		FrontEndMenuManager.m_bGameNotLoaded ||
 		FrontEndMenuManager.m_bMenuActive ||
@@ -562,9 +578,185 @@ androidgame::VrShouldUseTheaterMode(void)
 		FrontEndMenuManager.m_bWantToLoad ||
 		CGame::playingIntro ||
 		FindPlayerPed() == nil ||
-		CCutsceneMgr::IsCutsceneProcessing() ||
-		CCutsceneMgr::IsRunning() ||
-		TheCamera.m_WideScreenOn;
+		cutsceneOnScreen;
+}
+
+// Camera 0 is the director's own. Camera 1 and up are the staged actors, in
+// the order the scene created them; the player steps through them with R3
+// and keeps one with L3. Choosing for them never worked -- which actor the
+// shot is about changes from line to line -- so the choice is theirs and it
+// is remembered per scene.
+// The actor the eye is inside this frame, so its head can be kept out of
+// the way. Nothing else may touch it.
+static CEntity *gCutsceneCameraActor;
+
+// The actor whose head the eye is sitting in, or null. CCutsceneObject
+// asks so it can collapse that one head out of the shot.
+void *
+androidgame::VrCutsceneCameraActor(void)
+{
+	return gCutsceneCameraActor;
+}
+
+// Filming an actor from behind their own eyes needs a posed head bone, and
+// that means a skinned clump: the head does not live in an RwFrame at all,
+// the matrix comes out of the hanim hierarchy the same way CPedIK reads a
+// ped's bones. Cutscene actors and ordinary peds both qualify.
+static RpHAnimHierarchy*
+GetPosedHeadHierarchy(CEntity *entity)
+{
+	if(entity == nil || entity->m_rwObject == nil ||
+	   RwObjectGetType(entity->m_rwObject) != rpCLUMP)
+		return nil;
+	RpClump *clump = (RpClump*)entity->m_rwObject;
+	if(!IsClumpSkinned(clump))
+		return nil;
+	RpHAnimHierarchy *hierarchy = GetAnimHierarchyFromSkinClump(clump);
+	if(hierarchy == nil || RpHAnimIDGetIndex(hierarchy, BONE_head) < 0 ||
+	   RpHAnimHierarchyGetMatrixArray(hierarchy) == nil)
+		return nil;
+	return hierarchy;
+}
+
+// The heads the player can step through, in a fixed order so a remembered
+// choice means the same thing the next time the scene plays.
+static int
+StageCutsceneCameras(CEntity **actors, int maxActors)
+{
+	int staged = 0;
+	const int count = Min(CCutsceneMgr::GetNumCutsceneObjects(),
+		(int)NUMCUTSCENEOBJECTS);
+	for(int i = 0; i < count && staged < maxActors; i++){
+		CEntity *actor = CCutsceneMgr::GetCutsceneObject(i);
+		if(GetPosedHeadHierarchy(actor) != nil)
+			actors[staged++] = actor;
+	}
+	// A real cutscene has no one else in it. The player ped is parked
+	// under the world while one runs, so falling back to it there would
+	// drop the camera through the floor for the frames before the actors
+	// finish streaming in.
+	if(staged > 0 || CCutsceneMgr::IsRunning() ||
+	   CCutsceneMgr::IsCutsceneProcessing())
+		return staged;
+	// Not every scene is a cutscene. The drive to the hotel plays out in
+	// the real world with the real car and the real peds, and only the
+	// letterbox marks it as a scene, so CCutsceneMgr has nothing staged.
+	// The people in that shot are the player and whoever shares the car.
+	CPlayerPed *player = FindPlayerPed();
+	if(player == nil)
+		return staged;
+	if(GetPosedHeadHierarchy(player) != nil && staged < maxActors)
+		actors[staged++] = player;
+	CVehicle *vehicle = player->bInVehicle ? player->m_pMyVehicle : nil;
+	if(vehicle == nil)
+		return staged;
+	if(vehicle->pDriver != nil && vehicle->pDriver != player &&
+	   GetPosedHeadHierarchy(vehicle->pDriver) != nil && staged < maxActors)
+		actors[staged++] = vehicle->pDriver;
+	for(int i = 0; i < (int)ARRAY_SIZE(vehicle->pPassengers) &&
+	    staged < maxActors; i++){
+		CPed *passenger = vehicle->pPassengers[i];
+		if(passenger != nil && passenger != player &&
+		   GetPosedHeadHierarchy(passenger) != nil)
+			actors[staged++] = passenger;
+	}
+	return staged;
+}
+
+// One for the director's own camera, then one per staged head.
+int
+androidgame::VrCutsceneCameraCount(void)
+{
+	CEntity *actors[NUMCUTSCENEOBJECTS];
+	return StageCutsceneCameras(actors, ARRAY_SIZE(actors))+1;
+}
+
+static bool
+GetCutsceneActorHead(int camera, CVector *head, CVector *forward)
+{
+	gCutsceneCameraActor = nil;
+	if(camera <= 0)
+		return false;
+	CEntity *actors[NUMCUTSCENEOBJECTS];
+	const int staged = StageCutsceneCameras(actors, ARRAY_SIZE(actors));
+	if(camera > staged)
+		return false;
+	CEntity *actor = actors[camera-1];
+	RpHAnimHierarchy *hierarchy = GetPosedHeadHierarchy(actor);
+	if(hierarchy == nil)
+		return false;
+	RwMatrix *bonePose = &RpHAnimHierarchyGetMatrixArray(hierarchy)[
+		RpHAnimIDGetIndex(hierarchy, BONE_head)];
+	*head = CVector(RwMatrixGetPos(bonePose)->x,
+		RwMatrixGetPos(bonePose)->y,
+		RwMatrixGetPos(bonePose)->z);
+	// Where the actor is actually looking, taken off the bone. The root is
+	// no use: an actor is staged once and only its skeleton is animated
+	// after that, so the root still faces wherever the scene dropped it --
+	// which is how the view kept ending up behind the character's head.
+	// CPedIK yaws a head bone about its local X and pitches it about local
+	// Z, so the look axis is the remaining one, local Y: the up column of
+	// the posed matrix.
+	*forward = CVector(RwMatrixGetUp(bonePose)->x,
+		RwMatrixGetUp(bonePose)->y,
+		RwMatrixGetUp(bonePose)->z);
+	forward->z = 0.0f;
+	if(forward->MagnitudeSqr() < 0.0001f){
+		*forward = actor->GetForward();
+		forward->z = 0.0f;
+	}
+	if(forward->MagnitudeSqr() < 0.0001f)
+		*forward = CVector(0.0f, 1.0f, 0.0f);
+	forward->Normalise();
+	gCutsceneCameraActor = actor;
+	return true;
+}
+
+
+// The view the eyes actually use, written into the RenderWare camera so
+// everything that projects against it lands where the player is looking:
+// coronas, headlights, the sky and every sprite. Gameplay and cinematic
+// cutscenes both need it, so it lives here rather than inside either.
+static void
+SyncRenderWareCameraToVrView(void)
+{
+	rw::float32 vr[3], vu[3], va[3], vp[3];
+	if(rw::vulkan::getFirstPersonViewFrame(vr, vu, va, vp)){
+		RwMatrix *m = RwFrameGetMatrix(RwCameraGetFrame(Scene.camera));
+		RwMatrixGetRight(m)->x = vr[0];
+		RwMatrixGetRight(m)->y = vr[1];
+		RwMatrixGetRight(m)->z = vr[2];
+		RwMatrixGetUp(m)->x = vu[0];
+		RwMatrixGetUp(m)->y = vu[1];
+		RwMatrixGetUp(m)->z = vu[2];
+		RwMatrixGetAt(m)->x = va[0];
+		RwMatrixGetAt(m)->y = va[1];
+		RwMatrixGetAt(m)->z = va[2];
+		RwMatrixGetPos(m)->x = vp[0];
+		RwMatrixGetPos(m)->y = vp[1];
+		RwMatrixGetPos(m)->z = vp[2];
+		RwMatrixUpdate(m);
+		RwFrameUpdateObjects(RwCameraGetFrame(Scene.camera));
+		RwFrameOrthoNormalize(RwCameraGetFrame(Scene.camera));
+		const CVector viewPosition(vp[0], vp[1], vp[2]);
+		// Put the game camera on the same frame. Position alone was not
+		// enough: m_cameraMatrix is the inverse of this matrix and every
+		// IsSphereVisible in the game tests against it, so with a stale
+		// orientation the frustum belonged to the chase camera. That is
+		// what cut holes in the sea for anyone looking off the nose of a
+		// helicopter. CCamera::Process rebuilds this every frame from the
+		// active cam, so writing it here only affects rendering.
+		TheCamera.GetMatrix().GetRight() =
+			CVector(-vr[0], -vr[1], -vr[2]);
+		TheCamera.GetMatrix().GetForward() =
+			CVector(va[0], va[1], va[2]);
+		TheCamera.GetMatrix().GetUp() =
+			CVector(vu[0], vu[1], vu[2]);
+		TheCamera.GetMatrix().GetPosition() = viewPosition;
+		CRenderer::SetVrViewCameraPosition(viewPosition);
+		TheCamera.CalculateDerivedValues();
+		TheCamera.m_viewMatrix.Update();
+	}
 }
 
 // Decides whether this frame plays from inside the character's head and, if
@@ -579,6 +771,10 @@ androidgame::VrShouldUseTheaterMode(void)
 void
 VrUpdateFirstPersonAnchor(bool postPhysics)
 {
+	// Cleared here rather than where it is set: every ped tests this
+	// pointer in PreRender, and a scene that ends without clearing it
+	// leaves whoever lands on that address walking around headless.
+	gCutsceneCameraActor = nil;
 	CPlayerPed *player = FindPlayerPed();
 	const bool remoteMode =
 		CWorld::Players[CWorld::PlayerInFocus].IsPlayerInRemoteMode();
@@ -626,7 +822,21 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 		!CCutsceneMgr::IsRunning() &&
 		!TheCamera.m_WideScreenOn;
 
-	gVrFirstPersonActive = wantFirstPerson;
+	// A cinematic cutscene is rendered in stereo from the director camera.
+	// It has to go through the same first-person machinery as gameplay:
+	// coronas, headlights and the sky all project against the RenderWare
+	// camera, and with that camera left on the director's frame while the
+	// eyes moved with the head, they slid across the view in 2D.
+	const bool cinematicCutscene = !wantFirstPerson &&
+		androidgame::VrCutsceneMode() != 0 &&
+		gGameState == GS_PLAYING_GAME && player != nil &&
+		!FrontEndMenuManager.m_bMenuActive &&
+		!FrontEndMenuManager.m_bGameNotLoaded &&
+		!CGame::playingIntro &&
+		(CCutsceneMgr::IsRunning() ||
+		 CCutsceneMgr::IsCutsceneProcessing() ||
+		 TheCamera.m_WideScreenOn);
+	gVrFirstPersonActive = wantFirstPerson || cinematicCutscene;
 	gVrPlayerEntity = (CEntity*)player;
 	gVrInVehicle = wantFirstPerson && player->InVehicle() &&
 		player->m_pMyVehicle != nil &&
@@ -834,44 +1044,25 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 		// sprite screen mathematics -- then sees where the player really
 		// looks instead of the chase camera.
 		if(postPhysics){
-			rw::float32 vr[3], vu[3], va[3], vp[3];
-			if(rw::vulkan::getFirstPersonViewFrame(vr, vu, va, vp)){
-				RwMatrix *m = RwFrameGetMatrix(RwCameraGetFrame(Scene.camera));
-				RwMatrixGetRight(m)->x = vr[0];
-				RwMatrixGetRight(m)->y = vr[1];
-				RwMatrixGetRight(m)->z = vr[2];
-				RwMatrixGetUp(m)->x = vu[0];
-				RwMatrixGetUp(m)->y = vu[1];
-				RwMatrixGetUp(m)->z = vu[2];
-				RwMatrixGetAt(m)->x = va[0];
-				RwMatrixGetAt(m)->y = va[1];
-				RwMatrixGetAt(m)->z = va[2];
-				RwMatrixGetPos(m)->x = vp[0];
-				RwMatrixGetPos(m)->y = vp[1];
-				RwMatrixGetPos(m)->z = vp[2];
-				RwMatrixUpdate(m);
-				RwFrameUpdateObjects(RwCameraGetFrame(Scene.camera));
-				RwFrameOrthoNormalize(RwCameraGetFrame(Scene.camera));
-				const CVector viewPosition(vp[0], vp[1], vp[2]);
-				// Put the game camera on the same frame. Position alone was not
-				// enough: m_cameraMatrix is the inverse of this matrix and every
-				// IsSphereVisible in the game tests against it, so with a stale
-				// orientation the frustum belonged to the chase camera. That is
-				// what cut holes in the sea for anyone looking off the nose of a
-				// helicopter. CCamera::Process rebuilds this every frame from the
-				// active cam, so writing it here only affects rendering.
-				TheCamera.GetMatrix().GetRight() =
-					CVector(-vr[0], -vr[1], -vr[2]);
-				TheCamera.GetMatrix().GetForward() =
-					CVector(va[0], va[1], va[2]);
-				TheCamera.GetMatrix().GetUp() =
-					CVector(vu[0], vu[1], vu[2]);
-				TheCamera.GetMatrix().GetPosition() = viewPosition;
-				CRenderer::SetVrViewCameraPosition(viewPosition);
-				TheCamera.CalculateDerivedValues();
-				TheCamera.m_viewMatrix.Update();
-			}
+			SyncRenderWareCameraToVrView();
 		}
+	}else if(cinematicCutscene){
+		CVector forward = TheCamera.Cams[TheCamera.ActiveCam].Front;
+		forward.z = 0.0f;
+		if(forward.MagnitudeSqr() < 0.0001f)
+			forward = CVector(0.0f, 1.0f, 0.0f);
+		forward.Normalise();
+		CVector head = TheCamera.GetPosition();
+		CVector actorHead, actorForward;
+		if(GetCutsceneActorHead(androidgame::VrCutsceneCamera(),
+		  &actorHead, &actorForward)){
+			head = actorHead;
+			forward = actorForward;
+		}
+		rw::vulkan::setFirstPersonAnchor(&head.x,
+			Atan2(forward.y, forward.x), 1, 1);
+		if(postPhysics)
+			SyncRenderWareCameraToVrView();
 	}else{
 		rw::vulkan::setFirstPersonAnchor(nil, 0.0f, 0, 0);
 	}
@@ -1278,6 +1469,13 @@ Initialise(const VulkanContext &context, bool *renderTargetStartupFailure)
 		return false;
 	}
 	gRwInitialised = true;
+	// Before anything streams. The per-frame push below exists so the
+	// menu switch takes effect on what loads next, but by the time the
+	// first frame runs the world's textures already exist: pushed only
+	// from there, the setting missed almost every texture it was meant
+	// to cover.
+	rw::vulkan::setGenerateMipmaps(androidgame::VrGenerateMipmaps());
+	rw::vulkan::setRenderDiagnostics(androidgame::VrRenderDiagnostics());
 
 	RwRect r;
 	r.x = 0;
@@ -1392,6 +1590,15 @@ Step(void)
 	if(!gForegroundApp || !gRwInitialised)
 		return;
 	EnforceQuestTextureBudget();
+	// Whatever the mip worker finished since the last frame.
+	rw::vulkan::uploadFinishedMips();
+	{
+		static uint32 reportAt;
+		if(CTimer::GetTimeInMilliseconds() >= reportAt){
+			reportAt = CTimer::GetTimeInMilliseconds()+10000;
+			rw::vulkan::reportGeneratedMips();
+		}
+	}
 	// Hand the backend the time cycle planes the desktop renderer takes from
 	// the RenderWare camera. Without them the world ends at the far clip with
 	// a hard edge, which is plain to see from anything that can gain height.

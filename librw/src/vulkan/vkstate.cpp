@@ -227,7 +227,12 @@ getSampler(uint32 key, uint32 filter, uint32 addressU, uint32 addressV)
 	info.addressModeU = addressMode(addressU);
 	info.addressModeV = addressMode(addressV);
 	info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-	info.maxLod = VK_LOD_CLAMP_NONE;
+	// Every texture now carries a chain whether its TXD shipped one or
+	// not, so a material that asked for plain NEAREST or LINEAR has to be
+	// held at the base level. Without this the interface sheets, the fonts
+	// and the radar would start minifying along with the world.
+	info.maxLod = filter == Texture::NEAREST || filter == Texture::LINEAR ?
+		0.0f : VK_LOD_CLAMP_NONE;
 	if(gvk.deviceFeatures.samplerAnisotropy){
 		info.anisotropyEnable = VK_TRUE;
 		// Vice City's texture set is low resolution; past 4x the sampling cost

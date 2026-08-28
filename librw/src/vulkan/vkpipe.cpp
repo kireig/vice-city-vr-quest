@@ -533,7 +533,17 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 			textureAlpha ? 1 : 0);
 
 		const uint32 savedZWrite = gstate.zWriteEnabled;
-		if(vehicleAlphaPass && wantsBlend)
+		// The PS2 alpha rule, which reVC asks for and this backend used to
+		// ignore. A blended mesh that writes depth goes twice: the solid
+		// half claims the depth buffer, the faint half only blends. Without
+		// it the invisible border around a masked element writes depth for
+		// colour it never contributes, and whatever stands behind it is cut
+		// away -- a railing carving its own outline out of a wall.
+		const bool gsSplit = gstate.gsAlphaTest != 0 &&
+			getPs2AlphaTestEnabled() && wantsBlend &&
+			savedZWrite != 0 && !vehicleAlphaPass;
+		for(int gsPass = 0; gsPass < (gsSplit ? 2 : 1); gsPass++){
+		if((vehicleAlphaPass && wantsBlend) || (gsSplit && gsPass == 1))
 			gstate.zWriteEnabled = 0;
 		VkPipeline pipeline = getPipeline(shader,
 		                                  (VkPrimitiveTopology)header->primType);
@@ -570,7 +580,10 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 			push.surfaceProps[1] = 1.0f;
 			push.surfaceProps[2] = 0.0f;
 		}
-		push.surfaceProps[3] = gstate.alphaTestRef / 255.0f;
+		push.surfaceProps[3] = gsSplit ?
+			(gsPass == 0 ? gstate.gsAlphaTestRef/255.0f :
+				-(float32)gstate.gsAlphaTestRef/255.0f) :
+			gstate.alphaTestRef/255.0f;
 
 		vkCmdPushConstants(commandBuffer, getPipelineLayout(),
 		                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -578,6 +591,7 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 
 		vkCmdDrawIndexed(commandBuffer, inst->numIndex, 1,
 		                 inst->offset / 2, 0, 0);
+		}
 	}
 	}
 }

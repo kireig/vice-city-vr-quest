@@ -160,6 +160,23 @@ const unsigned char *VrDebugPixels(int *width, int *height);
 bool VrMenuConsumesInput(void);
 bool VrViceCityColorEnabled(void);
 bool VrFxaaEnabled(void);
+// Build a mip chain for textures whose TXD carries a single level.
+bool VrGenerateMipmaps(void);
+// The PS2 two-pass alpha rule for masked geometry.
+bool VrPs2AlphaTest(void);
+// Renderer counters in logcat, off unless asked for.
+bool VrRenderDiagnostics(void);
+// How a cutscene is presented: 0 the flat theater screen, 1 stereo from
+// the director camera.
+int VrCutsceneMode(void);
+// Which camera a stereo cutscene is watched from: 0 the director's own,
+// 1 and up the staged actors. The player cycles it with R3.
+int VrCutsceneCamera(void);
+// The cutscene actor the eye is sitting inside, or null. Its head is
+// collapsed for that frame so the shot is not filmed from inside a face.
+void *VrCutsceneCameraActor(void);
+// The director camera plus one per staged head.
+int VrCutsceneCameraCount(void);
 int VrSpatialAaMode(void);
 // Wrist panels: the minimap and the money/health/wanted readout, each on its
 // own arm. Index with the WRIST_PANEL_* values from librw's rwvk.h.

@@ -3104,6 +3104,50 @@ GetActiveTrackedWeaponAim(CVector *source, CVector *direction)
 	return true;
 }
 
+// The aim ray of whichever tracked weapon the player is holding, in world
+// space, or false when nothing is in hand. Worked out once a frame and kept:
+// the threat scan asks for it from every ped that might be looking down the
+// barrel, and none of them should pay for it twice.
+bool
+GetHeldTrackedWeaponAim(CVector *source, CVector *direction)
+{
+	static uint32 computedFrame = ~0u;
+	static bool held;
+	static CVector heldSource, heldDirection;
+
+	const uint32 frame = CTimer::GetFrameCounter();
+	if(frame != computedFrame){
+		computedFrame = frame;
+		held = false;
+		CPlayerPed *player = FindPlayerPed();
+		for(int hand = 0; player != nil && hand < 2 && !held; hand++){
+			if(!IsTrackedWeaponHeld(hand))
+				continue;
+			const int slot = GetHeldWeaponSlot(hand);
+			if(slot < 0 || slot >= TOTAL_WEAPON_SLOTS)
+				continue;
+			CWeapon *weapon = &player->GetWeapon(slot);
+			// The same list the laser draws for: something with a barrel,
+			// pointed where the hand points. A camera is not a threat and
+			// neither is a fist.
+			if(weapon == nil ||
+			   !IsPhysicalGunType(weapon->m_eWeaponType) ||
+			   weapon->m_eWeaponType == WEAPONTYPE_CAMERA)
+				continue;
+			if(!GetTrackedWeaponAim(hand, weapon->m_eWeaponType,
+			   &heldSource, &heldDirection))
+				continue;
+			heldDirection.Normalise();
+			held = true;
+		}
+	}
+	if(!held || source == nil || direction == nil)
+		return false;
+	*source = heldSource;
+	*direction = heldDirection;
+	return true;
+}
+
 bool
 GetActiveTrackedThrowableLaunch(CVector *source, CVector *velocity)
 {

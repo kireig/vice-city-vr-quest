@@ -30,6 +30,7 @@
 #include "Shadows.h"
 #include "ParticleObject.h"
 #include "CutsceneMgr.h"
+#include "Camera.h"
 #include "PlayerInfo.h"
 #include "PlayerPed.h"
 #include "Timer.h"
@@ -144,6 +145,35 @@ static bool gViceCityColorEnabled = true;
 // Stable single-frame FXAA. The stronger 3x3 experiment produced no visible
 // headset improvement over this path, so do not expose duplicate choices.
 static int gSpatialAaMode = 1;
+// Vice City ships single-level world textures, so distant fences and
+// signs are minified straight off the full-size image and crawl. The
+// chain is built on a worker thread, so the only cost the player pays
+// is about a third more texture memory.
+static int gGenerateMipmaps = 1;
+// The PS2 two-pass alpha rule the desktop backends have always run: the
+// solid half of a blended mesh writes depth, the faint half only blends.
+// Without it the invisible border around a railing cuts its own outline
+// out of the wall behind it. It costs a second draw for that geometry,
+// so there is a way to turn it off and compare.
+static int gPs2AlphaTest = 1;
+// Renderer counters in logcat. A shipped build has no business
+// writing to a player log every ten seconds, so this stays off
+// unless it is asked for.
+static int gRenderDiagnostics;
+// A cutscene runs its own director camera. CINEMA puts that camera on
+// the flat theater screen, which is where it has always gone; the other
+// modes let the headset render it in stereo instead, so the scene has
+// depth and the player can look around inside the shot.
+static int gCutsceneMode;
+// Which camera this cutscene is being watched from: 0 is the director's
+// own, 1 and up are the staged actors in the order the scene put them
+// there. Picking the right one automatically never worked -- what the
+// shot is about changes from scene to scene -- so the player cycles it
+// and keeps the one they liked, per scene, for next time.
+static int gCutsceneCamera;
+static char gCutsceneCameraScene[32];
+static bool gCutsceneCycleDown;
+static bool gCutsceneStoreDown;
 static bool gQuestQuickTestStart;
 static int gQuestRenderScalePercent = 125;
 static int gQuestSgsrMode = rw::vulkan::SGSR_OFF;
@@ -472,6 +502,9 @@ enum eVrGraphicsMenuItem {
 	VR_GRAPHICS_SGSR,
 	VR_GRAPHICS_MSAA,
 	VR_GRAPHICS_FXAA,
+	VR_GRAPHICS_MIPMAPS,
+	VR_GRAPHICS_PS2_ALPHA,
+	VR_GRAPHICS_DIAGNOSTICS,
 	VR_GRAPHICS_COLOR,
 	VR_GRAPHICS_PROFILER,
 	VR_GRAPHICS_CPU_PERFORMANCE,
@@ -548,6 +581,7 @@ enum eVrLocomotionMenuItem {
 	VR_LOCOMOTION_TURN_SENSITIVITY,
 	VR_LOCOMOTION_SNAP_ANGLE,
 	VR_LOCOMOTION_HEAD_BOBBING,
+	VR_LOCOMOTION_CUTSCENES,
 	VR_LOCOMOTION_REFRESH_RATE,
 	VR_LOCOMOTION_RECENTER,
 	VR_LOCOMOTION_BACK,
@@ -755,6 +789,18 @@ LoadVrSettings(void)
 	gViceCityColorEnabled =
 		GetPrivateProfileIntA("VR", "ViceCityColor", 1,
 			".\\vr_settings.ini") != 0;
+	gGenerateMipmaps = GetPrivateProfileIntA("VR", "GenerateMipmaps", 1,
+		".\\vr_settings.ini") != 0 ? 1 : 0;
+	gPs2AlphaTest = GetPrivateProfileIntA("VR", "Ps2AlphaTest", 1,
+		".\\vr_settings.ini") != 0 ? 1 : 0;
+	gRenderDiagnostics = GetPrivateProfileIntA("VR",
+		"RenderDiagnostics", 0, ".\\vr_settings.ini") != 0 ? 1 : 0;
+	gCutsceneMode = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"CutsceneMode", 0, ".\\vr_settings.ini"), 0, 1);
+	// Remembered across launches so a build handed over for testing can
+	// come up already showing it. Off for everyone else.
+	QuestProfilerSetEnabled(GetPrivateProfileIntA("VR", "ShowProfiler",
+		0, ".\\vr_settings.ini") != 0);
 	gSpatialAaMode = GetPrivateProfileIntA("VR", "AntiAliasing", 1,
 		".\\vr_settings.ini") != 0;
 	gQuestQuickTestStart =
@@ -1047,6 +1093,26 @@ SaveGameplayHud(void)
 {
 	WritePrivateProfileStringA("VR", "GameplayHud",
 		gGameplayHudEnabled ? "1" : "0", ".\\vr_settings.ini");
+}
+
+// One key per cutscene name under its own section, so the list grows with
+// whatever the player actually watches instead of shipping a table.
+static void
+LoadCutsceneCameraForScene(const char *scene)
+{
+	gCutsceneCamera = GetPrivateProfileIntA("VRCutsceneCamera",
+		scene, 0, ".\\vr_settings.ini");
+	if(gCutsceneCamera < 0)
+		gCutsceneCamera = 0;
+}
+
+static void
+SaveCutsceneCameraForScene(const char *scene)
+{
+	char value[16];
+	snprintf(value, sizeof(value), "%d", gCutsceneCamera);
+	WritePrivateProfileStringA("VRCutsceneCamera", scene, value,
+		".\\vr_settings.ini");
 }
 
 static void
@@ -1732,12 +1798,51 @@ VrDebugUpdate(const PadInput &in)
 	}
 	gVrCheatShortcutDown = cheatShortcut;
 
+	// A stereo cutscene owns the stick clicks while it runs: R3 steps to
+	// the next camera, L3 keeps the one on screen for this scene. The
+	// scene name is the key, so the choice comes back the next time the
+	// same cutscene plays.
+	const bool cutsceneCameras = !gVrMenuVisible && gCutsceneMode != 0 &&
+		(CCutsceneMgr::IsRunning() || TheCamera.m_WideScreenOn);
+	if(cutsceneCameras){
+		// A scripted sequence has no name of its own, so every one of
+		// them shares a key. They are rare and they are all the same
+		// kind of shot.
+		const char *scene = CCutsceneMgr::IsRunning() ?
+			CCutsceneMgr::GetCutsceneName() : "scripted";
+		if(scene != nil &&
+		   strncmp(scene, gCutsceneCameraScene,
+		     sizeof(gCutsceneCameraScene)-1) != 0){
+			strncpy(gCutsceneCameraScene, scene,
+				sizeof(gCutsceneCameraScene)-1);
+			gCutsceneCameraScene[sizeof(gCutsceneCameraScene)-1] = '\0';
+			LoadCutsceneCameraForScene(gCutsceneCameraScene);
+		}
+		const bool cycle = in.rightStickClick && !in.leftStickClick;
+		const bool store = in.leftStickClick && !in.rightStickClick;
+		if(cycle && !gCutsceneCycleDown){
+			// One past the last actor wraps back to the director.
+			const int cameras = androidgame::VrCutsceneCameraCount();
+			gCutsceneCamera = cameras > 0 ?
+				(gCutsceneCamera+1)%cameras : 0;
+		}
+		if(store && !gCutsceneStoreDown &&
+		   gCutsceneCameraScene[0] != '\0')
+			SaveCutsceneCameraForScene(gCutsceneCameraScene);
+		gCutsceneCycleDown = cycle;
+		gCutsceneStoreDown = store;
+	}else{
+		gCutsceneCycleDown = false;
+		gCutsceneStoreDown = false;
+		gCutsceneCameraScene[0] = '\0';
+	}
+
 	// Both stick clicks rebuild the gameplay reference space, the desktop
 	// chord's job. No grips in it: reaching for one picks a weapon up. The
 	// clicks are free for it because R3 and L3 hand their pad behaviour to
 	// CONTROLS, off by default.
 	const bool recenterShortcut =
-		!gVrMenuVisible && !VrShouldUseTheaterMode() &&
+		!gVrMenuVisible && !VrShouldUseTheaterMode() && !cutsceneCameras &&
 		in.leftStickClick && in.rightStickClick;
 	if(recenterShortcut && !gTouchRecenterShortcutDown)
 		androidgame::VrRecenterView();
@@ -1856,6 +1961,18 @@ VrDebugUpdate(const PadInput &in)
 			}else if(gVrGraphicsSelection == VR_GRAPHICS_MSAA){
 				gQuestMsaaSamples = 1;
 				SaveVrInteger("MsaaSamples", gQuestMsaaSamples);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_DIAGNOSTICS){
+				gRenderDiagnostics = !gRenderDiagnostics;
+				SaveVrInteger("RenderDiagnostics", gRenderDiagnostics);
+				rw::vulkan::setRenderDiagnostics(gRenderDiagnostics);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_PS2_ALPHA){
+				gPs2AlphaTest = !gPs2AlphaTest;
+				SaveVrInteger("Ps2AlphaTest", gPs2AlphaTest);
+				rw::vulkan::setPs2AlphaTestEnabled(gPs2AlphaTest);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_MIPMAPS){
+				gGenerateMipmaps = !gGenerateMipmaps;
+				SaveVrInteger("GenerateMipmaps", gGenerateMipmaps);
+				rw::vulkan::setGenerateMipmaps(gGenerateMipmaps);
 			}else if(gVrGraphicsSelection == VR_GRAPHICS_FXAA){
 				gSpatialAaMode = !gSpatialAaMode;
 				SaveFxaa();
@@ -1864,6 +1981,8 @@ VrDebugUpdate(const PadInput &in)
 				SaveViceCityColor();
 			}else if(gVrGraphicsSelection == VR_GRAPHICS_PROFILER){
 				QuestProfilerSetEnabled(!QuestProfilerIsEnabled());
+				SaveVrInteger("ShowProfiler",
+					QuestProfilerIsEnabled() ? 1 : 0);
 			}else if(gVrGraphicsSelection == VR_GRAPHICS_CPU_PERFORMANCE){
 				if(xrvk::isPerformanceModeSupported()){
 					const int direction = decreasePulse ? -1 : 1;
@@ -2390,6 +2509,11 @@ VrDebugUpdate(const PadInput &in)
 						gQuestTurnSensitivityPercent);
 				}
 				break;
+			case VR_LOCOMOTION_CUTSCENES:
+				gCutsceneMode = (gCutsceneMode+2+
+					(decreasePulse ? -1 : 1))%2;
+				SaveVrInteger("CutsceneMode", gCutsceneMode);
+				break;
 			case VR_LOCOMOTION_HEAD_BOBBING:
 				gQuestHeadBobbing = !gQuestHeadBobbing;
 				SaveVrInteger("HeadBobbing", gQuestHeadBobbing);
@@ -2702,10 +2826,19 @@ DrawQuestGraphicsPage(void)
 		"STEREO MSAA  < DISABLED - NO VISIBLE GAIN >");
 	snprintf(rows[VR_GRAPHICS_FXAA], sizeof(rows[0]),
 		"SPATIAL AA  < %s >", gSpatialAaMode ? "ON" : "OFF");
+	snprintf(rows[VR_GRAPHICS_PS2_ALPHA], sizeof(rows[0]),
+		"* PS2 ALPHA (FENCE FIX)  < %s >",
+		gPs2AlphaTest ? "ON" : "OFF");
+	snprintf(rows[VR_GRAPHICS_MIPMAPS], sizeof(rows[0]),
+		"* GENERATE MIPMAPS  < %s >",
+		gGenerateMipmaps ? "ON (RESTART)" : "OFF");
+	snprintf(rows[VR_GRAPHICS_DIAGNOSTICS], sizeof(rows[0]),
+		"* RENDERER LOG  < %s >",
+		gRenderDiagnostics ? "ON" : "OFF");
 	snprintf(rows[VR_GRAPHICS_COLOR], sizeof(rows[0]),
 		"COLOR FILTER  < %s >", gViceCityColorEnabled ? "ON" : "OFF");
 	snprintf(rows[VR_GRAPHICS_PROFILER], sizeof(rows[0]),
-		"PERFORMANCE PROFILER  < %s >",
+		"* PERFORMANCE PROFILER (FPS)  < %s >",
 		QuestProfilerIsEnabled() ? "ON" : "OFF");
 	snprintf(rows[VR_GRAPHICS_CPU_PERFORMANCE], sizeof(rows[0]),
 		"CPU PERFORMANCE < %s > ACTIVE %s",
@@ -2735,8 +2868,15 @@ DrawQuestGraphicsPage(void)
 		gQuestQuickTestStart ? "ON" : "OFF");
 	strcpy(rows[VR_GRAPHICS_BACK], "BACK TO SETTINGS");
 	for(int item = 0; item < VR_GRAPHICS_ITEM_COUNT; item++)
-		DrawFullVrMenuRow(rows[item], 142+item*33, 3,
-			item == gVrGraphicsSelection);
+		// The developer rows are drawn in the positive green so they
+		// read as instruments rather than settings: a page of identical
+		// lines is where the profiler kept getting lost.
+		DrawFullVrMenuRow(rows[item], 142+item*31, 3,
+			item == gVrGraphicsSelection, true, false,
+			item == VR_GRAPHICS_PROFILER ||
+				item == VR_GRAPHICS_MIPMAPS ||
+				item == VR_GRAPHICS_PS2_ALPHA ||
+				item == VR_GRAPHICS_DIAGNOSTICS);
 	if(scaleStatusValid){
 		char activeScale[192];
 		snprintf(activeScale, sizeof(activeScale),
@@ -2752,11 +2892,11 @@ DrawQuestGraphicsPage(void)
 					scaleStatus.fallbackReason) : "");
 		const bool fallback = scaleStatus.fallbackReason !=
 			xrvk::RENDER_SCALE_FALLBACK_NONE;
-		DrawVrMenuText(activeScale, VR_MENU_WIDTH/2, 608, 2,
+		DrawVrMenuText(activeScale, VR_MENU_WIDTH/2, 678, 2,
 			fallback ? 255 : 120, fallback ? 95 : 220,
 			fallback ? 85 : 255);
 		DrawVrMenuText("NATIVE SCENE  SPATIAL AA SINGLE-FRAME",
-			VR_MENU_WIDTH/2, 630, 2, 170, 190, 210);
+			VR_MENU_WIDTH/2, 700, 2, 170, 190, 210);
 		if(scaleStatus.previousFallbackReason !=
 		   xrvk::RENDER_SCALE_FALLBACK_NONE){
 			char recoveredScale[192];
@@ -2766,7 +2906,7 @@ DrawQuestGraphicsPage(void)
 				scaleStatus.previousFallbackPercent,
 				xrvk::getRenderScaleFallbackReasonName(
 					scaleStatus.previousFallbackReason));
-			DrawVrMenuText(recoveredScale, VR_MENU_WIDTH/2, 652, 2,
+			DrawVrMenuText(recoveredScale, VR_MENU_WIDTH/2, 722, 2,
 				255, 105, 85);
 		}
 	}
@@ -3262,6 +3402,9 @@ DrawQuestLocomotionPage(void)
 		"SNAP TURN ANGLE  < %d DEG >", gQuestSnapTurnAngleDegrees);
 	snprintf(rows[VR_LOCOMOTION_HEAD_BOBBING], sizeof(rows[0]),
 		"WALKING HEAD BOB  < %s >", gQuestHeadBobbing ? "ON" : "OFF");
+	snprintf(rows[VR_LOCOMOTION_CUTSCENES], sizeof(rows[0]),
+		"CUTSCENES  < %s >",
+		gCutsceneMode ? "STEREO  R3 CAMERA  L3 KEEP" : "CINEMA SCREEN");
 	snprintf(rows[VR_LOCOMOTION_REFRESH_RATE], sizeof(rows[0]),
 		"REFRESH RATE  < %d HZ >", gQuestRefreshRateHz);
 	strcpy(rows[VR_LOCOMOTION_RECENTER], "RECENTER VIEW");
@@ -3879,6 +4022,40 @@ VrViceCityColorEnabled(void)
 {
 	LoadVrSettings();
 	return gViceCityColorEnabled;
+}
+
+int
+VrCutsceneCamera(void)
+{
+	return gCutsceneCamera;
+}
+
+int
+VrCutsceneMode(void)
+{
+	LoadVrSettings();
+	return gCutsceneMode;
+}
+
+bool
+VrRenderDiagnostics(void)
+{
+	LoadVrSettings();
+	return gRenderDiagnostics != 0;
+}
+
+bool
+VrPs2AlphaTest(void)
+{
+	LoadVrSettings();
+	return gPs2AlphaTest != 0;
+}
+
+bool
+VrGenerateMipmaps(void)
+{
+	LoadVrSettings();
+	return gGenerateMipmaps != 0;
 }
 
 bool

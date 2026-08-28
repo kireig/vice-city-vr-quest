@@ -16,6 +16,11 @@
 #ifdef RW_VULKAN
 #include <android/log.h>
 #define VKLOG(...) __android_log_print(ANDROID_LOG_INFO, "librw-vk", __VA_ARGS__)
+#include <time.h>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #define VKERR(...) __android_log_print(ANDROID_LOG_ERROR, "librw-vk", __VA_ARGS__)
 #endif
 
@@ -44,6 +49,248 @@ size_t
 getTextureMemoryUsed(void)
 {
 	return gTextureMemoryUsed;
+}
+
+// ---------------------------------------------------------------------------
+// Mip generation
+//
+// Vice City's world textures are single level. Minifying a 256x256 fence off
+// its base image samples one texel out of the dozens a distant pixel covers,
+// which is what makes far railings and chain link crawl. The TXDs cannot be
+// changed -- they are the player's own game data -- so the chain is built
+// here, once, as each texture is uploaded.
+//
+// The filter is alpha weighted. A plain box filter averages the colour of
+// texels that are not there: the cut-out half of a fence is black, and
+// averaging it into the bars leaves every distant fence outlined in whatever
+// the artist left behind the mask. Weighting each texel by its own alpha
+// keeps the colour of the part that is actually visible.
+// ---------------------------------------------------------------------------
+
+// Why a texture was passed over. Reported periodically, so a build that
+// quietly generates nothing can say which test it failed.
+static uint32 gMipSeen, gMipMade, gMipOffFlag, gMipNotTexture,
+	gMipTooSmall, gMipBadFormat;
+// Total time spent filtering and re-encoding, so the cost of this is a
+// number rather than an impression.
+static uint64 gMipMicroseconds;
+static uint8 *gMipScratch[2];
+static size_t gMipScratchBytes;
+// Nothing waits on the chain any more, so the only reason to refuse a
+// texture is the scratch it would need: the worker holds two buffers of
+// the base size, and 2048 square is 16 MB apiece.
+static uint32 gMipSizeLimit = 2048;
+static uint32 gMipTooLarge, gMipLanded;
+
+static uint64
+microseconds(void)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64)now.tv_sec*1000000ull + (uint64)now.tv_nsec/1000ull;
+}
+
+void
+reportGeneratedMips(void)
+{
+	if(!renderDiagnosticsEnabled())
+		return;
+	VKLOG("mips: seen %u made %u in %llu ms | rejected flag %u type %u "
+	      "size %u large %u format %u | landed %u",
+	      gMipSeen, gMipMade,
+	      (unsigned long long)(gMipMicroseconds/1000ull),
+	      gMipOffFlag, gMipNotTexture, gMipTooSmall, gMipTooLarge,
+	      gMipBadFormat, gMipLanded);
+}
+
+static bool32
+wantsGeneratedMips(Raster *raster, VkFormat format)
+{
+	gMipSeen++;
+	if(!gvk.generateMipmaps){
+		gMipOffFlag++;
+		return 0;
+	}
+	if((raster->type & 0xF) != Raster::TEXTURE){
+		gMipNotTexture++;
+		return 0;
+	}
+	// Below this a chain is one or two levels of nothing, and the small
+	// interface sheets are the ones that must stay crisp.
+	if(raster->width < 16 || raster->height < 16){
+		gMipTooSmall++;
+		return 0;
+	}
+	if((uint32)raster->width > gMipSizeLimit ||
+	   (uint32)raster->height > gMipSizeLimit){
+		gMipTooLarge++;
+		return 0;
+	}
+	// The block formats are handled by the codec below; the rest are
+	// filtered in place.
+	const bool32 usable = format == VK_FORMAT_R8G8B8A8_UNORM ||
+	       format == VK_FORMAT_R4G4B4A4_UNORM_PACK16 ||
+	       format == VK_FORMAT_A1R5G5B5_UNORM_PACK16 ||
+	       format == VK_FORMAT_R5G5B5A1_UNORM_PACK16 ||
+	       format == VK_FORMAT_R5G6B5_UNORM_PACK16 ||
+	       format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ||
+	       format == VK_FORMAT_BC2_UNORM_BLOCK ||
+	       format == VK_FORMAT_BC3_UNORM_BLOCK;
+	if(!usable){
+		if(gMipBadFormat < 4 && renderDiagnosticsEnabled())
+			VKLOG("mips: format %d not downsampled (%dx%d)",
+			      (int)format, raster->width, raster->height);
+		gMipBadFormat++;
+		return 0;
+	}
+	gMipMade++;
+	return 1;
+}
+
+// One texel of any supported format as 8-bit RGBA.
+static void
+readTexel(const uint8 *src, VkFormat format, uint32 *rgba)
+{
+	switch(format){
+	case VK_FORMAT_R8G8B8A8_UNORM:
+		rgba[0] = src[0]; rgba[1] = src[1];
+		rgba[2] = src[2]; rgba[3] = src[3];
+		break;
+	case VK_FORMAT_R4G4B4A4_UNORM_PACK16: {
+		const uint32 v = (uint32)src[0] | ((uint32)src[1] << 8);
+		rgba[0] = ((v >> 12) & 0xF)*17; rgba[1] = ((v >> 8) & 0xF)*17;
+		rgba[2] = ((v >> 4) & 0xF)*17;  rgba[3] = (v & 0xF)*17;
+		break;
+	}
+	case VK_FORMAT_A1R5G5B5_UNORM_PACK16: {
+		const uint32 v = (uint32)src[0] | ((uint32)src[1] << 8);
+		rgba[0] = (((v >> 10) & 0x1F)*255)/31;
+		rgba[1] = (((v >> 5) & 0x1F)*255)/31;
+		rgba[2] = ((v & 0x1F)*255)/31;
+		rgba[3] = (v >> 15) ? 255 : 0;
+		break;
+	}
+	case VK_FORMAT_R5G5B5A1_UNORM_PACK16: {
+		const uint32 v = (uint32)src[0] | ((uint32)src[1] << 8);
+		rgba[0] = (((v >> 11) & 0x1F)*255)/31;
+		rgba[1] = (((v >> 6) & 0x1F)*255)/31;
+		rgba[2] = (((v >> 1) & 0x1F)*255)/31;
+		rgba[3] = (v & 1) ? 255 : 0;
+		break;
+	}
+	default: {	// R5G6B5, no alpha
+		const uint32 v = (uint32)src[0] | ((uint32)src[1] << 8);
+		rgba[0] = (((v >> 11) & 0x1F)*255)/31;
+		rgba[1] = (((v >> 5) & 0x3F)*255)/63;
+		rgba[2] = ((v & 0x1F)*255)/31;
+		rgba[3] = 255;
+		break;
+	}
+	}
+}
+
+static void
+writeTexel(uint8 *dst, VkFormat format, const uint32 *rgba)
+{
+	switch(format){
+	case VK_FORMAT_R8G8B8A8_UNORM:
+		dst[0] = (uint8)rgba[0]; dst[1] = (uint8)rgba[1];
+		dst[2] = (uint8)rgba[2]; dst[3] = (uint8)rgba[3];
+		break;
+	case VK_FORMAT_R4G4B4A4_UNORM_PACK16: {
+		const uint32 v = (((rgba[0]+8)/17) << 12) | (((rgba[1]+8)/17) << 8) |
+		                 (((rgba[2]+8)/17) << 4) | ((rgba[3]+8)/17);
+		dst[0] = (uint8)(v & 0xFF); dst[1] = (uint8)(v >> 8);
+		break;
+	}
+	case VK_FORMAT_A1R5G5B5_UNORM_PACK16: {
+		const uint32 v = ((rgba[3] >= 128 ? 1u : 0u) << 15) |
+		                 (((rgba[0]*31+127)/255) << 10) |
+		                 (((rgba[1]*31+127)/255) << 5) |
+		                 ((rgba[2]*31+127)/255);
+		dst[0] = (uint8)(v & 0xFF); dst[1] = (uint8)(v >> 8);
+		break;
+	}
+	case VK_FORMAT_R5G5B5A1_UNORM_PACK16: {
+		const uint32 v = (((rgba[0]*31+127)/255) << 11) |
+		                 (((rgba[1]*31+127)/255) << 6) |
+		                 (((rgba[2]*31+127)/255) << 1) |
+		                 (rgba[3] >= 128 ? 1u : 0u);
+		dst[0] = (uint8)(v & 0xFF); dst[1] = (uint8)(v >> 8);
+		break;
+	}
+	default: {
+		const uint32 v = (((rgba[0]*31+127)/255) << 11) |
+		                 (((rgba[1]*63+127)/255) << 5) |
+		                 ((rgba[2]*31+127)/255);
+		dst[0] = (uint8)(v & 0xFF); dst[1] = (uint8)(v >> 8);
+		break;
+	}
+	}
+}
+
+static uint32 levelDimension(uint32 base, int32 level);
+static void cancelGeneratedMips(VulkanRaster *native);
+
+static VkDeviceSize
+alignLevel(VkDeviceSize size)
+{
+	return (size+3) & ~(VkDeviceSize)3;
+}
+
+// How much room the generated levels need after the base image. The chain
+// rides in the same staging allocation the base already uses, so a streaming
+// burst costs exactly as many buffers as it did before mips existed.
+static VkDeviceSize
+generatedMipBytes(int32 numLevels, uint32 baseWidth, uint32 baseHeight,
+                  uint32 bytesPerPixel)
+{
+	VkDeviceSize total = 0;
+	for(int32 level = 1; level < numLevels; level++)
+		total += alignLevel((VkDeviceSize)levelDimension(baseWidth, level)*
+		         levelDimension(baseHeight, level)*bytesPerPixel);
+	return total;
+}
+
+// One level down, halving in each axis. An odd dimension drops its last row
+// or column, which is what Vulkan's own chain does.
+static void
+downsampleLevel(const uint8 *src, uint32 srcWidth, uint32 srcHeight,
+                uint8 *dst, uint32 dstWidth, uint32 dstHeight,
+                VkFormat format, uint32 bytesPerPixel)
+{
+	for(uint32 y = 0; y < dstHeight; y++){
+		const uint32 y0 = y*2;
+		const uint32 y1 = y0+1 < srcHeight ? y0+1 : y0;
+		for(uint32 x = 0; x < dstWidth; x++){
+			const uint32 x0 = x*2;
+			const uint32 x1 = x0+1 < srcWidth ? x0+1 : x0;
+			uint32 texel[4][4];
+			readTexel(src+(y0*srcWidth+x0)*bytesPerPixel, format, texel[0]);
+			readTexel(src+(y0*srcWidth+x1)*bytesPerPixel, format, texel[1]);
+			readTexel(src+(y1*srcWidth+x0)*bytesPerPixel, format, texel[2]);
+			readTexel(src+(y1*srcWidth+x1)*bytesPerPixel, format, texel[3]);
+			uint32 alpha = 0;
+			for(int i = 0; i < 4; i++)
+				alpha += texel[i][3];
+			uint32 out[4];
+			if(alpha == 0){
+				// Nothing visible to weight by; keep the plain average so a
+				// fully cut-out corner still carries a sane colour.
+				for(int c = 0; c < 3; c++)
+					out[c] = (texel[0][c]+texel[1][c]+
+					          texel[2][c]+texel[3][c]+2)/4;
+			}else{
+				for(int c = 0; c < 3; c++)
+					out[c] = (texel[0][c]*texel[0][3]+
+					          texel[1][c]*texel[1][3]+
+					          texel[2][c]*texel[2][3]+
+					          texel[3][c]*texel[3][3]+alpha/2)/alpha;
+			}
+			out[3] = (alpha+2)/4;
+			writeTexel(dst+(y*dstWidth+x)*bytesPerPixel, format, out);
+		}
+	}
 }
 
 static VkFormat
@@ -126,6 +373,8 @@ createNativeRaster(void *object, int32 offset, int32)
 static void*
 destroyNativeRaster(void *object, int32 offset, int32)
 {
+	// A texture can be evicted while its chain is still being built.
+	cancelGeneratedMips(PLUGINOFFSET(VulkanRaster, object, offset));
 	VulkanRaster *native = PLUGINOFFSET(VulkanRaster, object, offset);
 	if(gvk.device != VK_NULL_HANDLE){
 		if(native->stagingMapped != nil)
@@ -213,13 +462,18 @@ rasterCreate(Raster *raster)
 	raster->stride = raster->width * bytesPerPixel;
 
 	native->numLevels = 1;
-	if(raster->format & (Raster::MIPMAP | Raster::AUTOMIPMAP)){
+	native->generateMips = 0;
+	if((raster->format & (Raster::MIPMAP | Raster::AUTOMIPMAP)) ||
+	   wantsGeneratedMips(raster, native->format)){
 		uint32 size = raster->width > raster->height ?
 		              (uint32)raster->width : (uint32)raster->height;
 		while(size > 1){
 			size >>= 1;
 			native->numLevels++;
 		}
+		native->generateMips =
+			(raster->format & (Raster::MIPMAP | Raster::AUTOMIPMAP)) ?
+				0 : 1;
 	}
 
 	const bool32 isDepth = (raster->type & 0xF) == Raster::ZBUFFER;
@@ -299,6 +553,301 @@ rasterCreate(Raster *raster)
 // transparent whenever colour0 <= colour1. Foliage in Vice City uses this
 // extensively, so trusting only the header would incorrectly classify its
 // material as opaque and draw the black padding around palm leaves.
+// ---------------------------------------------------------------------------
+// Block compression
+//
+// Adreno accepts BC, so the game's DXT blocks reach the GPU untouched and
+// never pass through the uncompressed path above. Giving those textures a
+// chain means working in blocks: decode a level, filter it, encode it again.
+// The base level is always the artist's own blocks; only the generated levels
+// are re-encoded, and a mip is forgiving of a simple endpoint fit.
+// ---------------------------------------------------------------------------
+
+static uint32
+bcBlockBytes(VkFormat format)
+{
+	return format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? 8 : 16;
+}
+
+static void
+decodeColourBlock(const uint8 *block, bool32 punchThrough, uint8 *rgba)
+{
+	const uint32 c0 = (uint32)block[0] | ((uint32)block[1] << 8);
+	const uint32 c1 = (uint32)block[2] | ((uint32)block[3] << 8);
+	const uint32 indices = (uint32)block[4] | ((uint32)block[5] << 8) |
+	                       ((uint32)block[6] << 16) | ((uint32)block[7] << 24);
+	uint32 red[4], green[4], blue[4], alpha[4];
+	red[0] = (((c0 >> 11) & 0x1F)*255)/31;
+	green[0] = (((c0 >> 5) & 0x3F)*255)/63;
+	blue[0] = ((c0 & 0x1F)*255)/31;
+	red[1] = (((c1 >> 11) & 0x1F)*255)/31;
+	green[1] = (((c1 >> 5) & 0x3F)*255)/63;
+	blue[1] = ((c1 & 0x1F)*255)/31;
+	alpha[0] = alpha[1] = alpha[2] = alpha[3] = 255;
+	if(c0 > c1 || !punchThrough){
+		red[2] = (red[0]*2+red[1])/3;
+		green[2] = (green[0]*2+green[1])/3;
+		blue[2] = (blue[0]*2+blue[1])/3;
+		red[3] = (red[0]+red[1]*2)/3;
+		green[3] = (green[0]+green[1]*2)/3;
+		blue[3] = (blue[0]+blue[1]*2)/3;
+	}else{
+		red[2] = (red[0]+red[1])/2;
+		green[2] = (green[0]+green[1])/2;
+		blue[2] = (blue[0]+blue[1])/2;
+		red[3] = green[3] = blue[3] = 0;
+		alpha[3] = 0;
+	}
+	for(int t = 0; t < 16; t++){
+		const uint32 i = (indices >> (t*2)) & 3;
+		rgba[t*4+0] = (uint8)red[i];
+		rgba[t*4+1] = (uint8)green[i];
+		rgba[t*4+2] = (uint8)blue[i];
+		rgba[t*4+3] = (uint8)alpha[i];
+	}
+}
+
+static void
+decodeBcBlock(const uint8 *block, VkFormat format, uint8 *rgba)
+{
+	if(format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK){
+		decodeColourBlock(block, 1, rgba);
+		return;
+	}
+	decodeColourBlock(block+8, 0, rgba);
+	if(format == VK_FORMAT_BC2_UNORM_BLOCK){
+		for(int t = 0; t < 16; t++){
+			const uint32 nibble = (block[t/2] >> ((t & 1)*4)) & 0xF;
+			rgba[t*4+3] = (uint8)(nibble*17);
+		}
+		return;
+	}
+	// BC3: two endpoints and three-bit indices.
+	uint32 value[8];
+	value[0] = block[0];
+	value[1] = block[1];
+	if(value[0] > value[1]){
+		for(int i = 1; i < 7; i++)
+			value[i+1] = ((7-i)*value[0] + i*value[1])/7;
+	}else{
+		for(int i = 1; i < 5; i++)
+			value[i+1] = ((5-i)*value[0] + i*value[1])/5;
+		value[6] = 0;
+		value[7] = 255;
+	}
+	uint64 bits = 0;
+	for(int i = 0; i < 6; i++)
+		bits |= (uint64)block[2+i] << (i*8);
+	for(int t = 0; t < 16; t++)
+		rgba[t*4+3] = (uint8)value[(bits >> (t*3)) & 7];
+}
+
+static void
+encodeColourBlock(const uint8 *rgba, bool32 punchThrough, uint8 *block)
+{
+	// Bounding box of the texels that are actually there. A mip level does not
+	// need a principal-axis fit; the endpoints only have to bracket what the
+	// block still contains.
+	uint32 lo[3] = { 255, 255, 255 }, hi[3] = { 0, 0, 0 };
+	bool32 anyOpaque = 0, anyClear = 0;
+	for(int t = 0; t < 16; t++){
+		if(punchThrough && rgba[t*4+3] < 128){
+			anyClear = 1;
+			continue;
+		}
+		anyOpaque = 1;
+		for(int c = 0; c < 3; c++){
+			const uint32 v = rgba[t*4+c];
+			if(v < lo[c]) lo[c] = v;
+			if(v > hi[c]) hi[c] = v;
+		}
+	}
+	if(!anyOpaque){
+		lo[0] = lo[1] = lo[2] = 0;
+		hi[0] = hi[1] = hi[2] = 0;
+	}
+	uint32 c0 = (((hi[0]*31+127)/255) << 11) | (((hi[1]*63+127)/255) << 5) |
+	            ((hi[2]*31+127)/255);
+	uint32 c1 = (((lo[0]*31+127)/255) << 11) | (((lo[1]*63+127)/255) << 5) |
+	            ((lo[2]*31+127)/255);
+	// BC1 reads the mode off the endpoint order, so it has to be forced.
+	const bool32 threeColour = punchThrough && anyClear;
+	if(threeColour){
+		if(c0 > c1){ const uint32 s = c0; c0 = c1; c1 = s; }
+		if(c0 == c1){
+			if(c1 < 0xFFFF) c1++;
+			else if(c0 > 0) c0--;
+		}
+	}else if(c0 <= c1){
+		if(c1 < 0xFFFF) c0 = c1+1;
+		else if(c1 > 0) { c0 = c1; c1--; }
+	}
+	uint8 palette[4][3];
+	palette[0][0] = (uint8)((((c0 >> 11) & 0x1F)*255)/31);
+	palette[0][1] = (uint8)((((c0 >> 5) & 0x3F)*255)/63);
+	palette[0][2] = (uint8)(((c0 & 0x1F)*255)/31);
+	palette[1][0] = (uint8)((((c1 >> 11) & 0x1F)*255)/31);
+	palette[1][1] = (uint8)((((c1 >> 5) & 0x3F)*255)/63);
+	palette[1][2] = (uint8)(((c1 & 0x1F)*255)/31);
+	for(int c = 0; c < 3; c++){
+		if(threeColour){
+			palette[2][c] =
+				(uint8)(((uint32)palette[0][c]+palette[1][c])/2);
+			palette[3][c] = 0;
+		}else{
+			palette[2][c] =
+				(uint8)(((uint32)palette[0][c]*2+palette[1][c])/3);
+			palette[3][c] =
+				(uint8)(((uint32)palette[0][c]+palette[1][c]*2)/3);
+		}
+	}
+	// Project each texel onto the endpoint axis rather than testing it
+	// against every palette entry. Same answer for a mip level, and this
+	// runs on the streaming thread for every texture the game loads.
+	const int axis[3] = {
+		(int)palette[1][0]-(int)palette[0][0],
+		(int)palette[1][1]-(int)palette[0][1],
+		(int)palette[1][2]-(int)palette[0][2]
+	};
+	const int axisLength =
+		axis[0]*axis[0]+axis[1]*axis[1]+axis[2]*axis[2];
+	// Palette order along the axis is 0, 2, 3, 1 for four colours and
+	// 0, 2, 1 for three.
+	static const uint32 fourStep[4] = { 0, 2, 3, 1 };
+	static const uint32 threeStep[3] = { 0, 2, 1 };
+	const int steps = threeColour ? 2 : 3;
+	uint32 indices = 0;
+	for(int t = 0; t < 16; t++){
+		uint32 best;
+		if(threeColour && rgba[t*4+3] < 128)
+			best = 3;
+		else if(axisLength == 0)
+			best = 0;
+		else{
+			const int along =
+				((int)rgba[t*4+0]-(int)palette[0][0])*axis[0]+
+				((int)rgba[t*4+1]-(int)palette[0][1])*axis[1]+
+				((int)rgba[t*4+2]-(int)palette[0][2])*axis[2];
+			int step = (along*steps*2+axisLength)/(axisLength*2);
+			if(step < 0) step = 0;
+			if(step > steps) step = steps;
+			best = threeColour ? threeStep[step] : fourStep[step];
+		}
+		indices |= best << (t*2);
+	}
+	block[0] = (uint8)(c0 & 0xFF); block[1] = (uint8)(c0 >> 8);
+	block[2] = (uint8)(c1 & 0xFF); block[3] = (uint8)(c1 >> 8);
+	block[4] = (uint8)(indices & 0xFF);
+	block[5] = (uint8)((indices >> 8) & 0xFF);
+	block[6] = (uint8)((indices >> 16) & 0xFF);
+	block[7] = (uint8)((indices >> 24) & 0xFF);
+}
+
+static void
+encodeBcBlock(const uint8 *rgba, VkFormat format, uint8 *block)
+{
+	if(format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK){
+		encodeColourBlock(rgba, 1, block);
+		return;
+	}
+	encodeColourBlock(rgba, 0, block+8);
+	if(format == VK_FORMAT_BC2_UNORM_BLOCK){
+		for(int i = 0; i < 8; i++)
+			block[i] = (uint8)((((rgba[(i*2+1)*4+3]+8)/17) << 4) |
+			                    ((rgba[(i*2)*4+3]+8)/17));
+		return;
+	}
+	// BC3: bracket the alphas and index into the eight-step ramp.
+	uint32 lo = 255, hi = 0;
+	for(int t = 0; t < 16; t++){
+		const uint32 a = rgba[t*4+3];
+		if(a < lo) lo = a;
+		if(a > hi) hi = a;
+	}
+	if(hi == lo){
+		if(hi < 255) hi = lo+1;
+		else lo = hi-1;
+	}
+	block[0] = (uint8)hi;
+	block[1] = (uint8)lo;
+	// Ramp position straight from the value: index 0 is hi, 1 is lo, and
+	// 2..7 walk between them.
+	const int span = (int)hi-(int)lo;
+	uint64 bits = 0;
+	for(int t = 0; t < 16; t++){
+		const int a = (int)rgba[t*4+3];
+		int step = (((int)hi-a)*7*2+span)/(span*2);
+		if(step < 0) step = 0;
+		if(step > 7) step = 7;
+		const uint64 best = step == 0 ? 0 : step == 7 ? 1 :
+			(uint64)(step+1);
+		bits |= best << (t*3);
+	}
+	for(int i = 0; i < 6; i++)
+		block[2+i] = (uint8)((bits >> (i*8)) & 0xFF);
+}
+
+// A whole level, block grid to RGBA and back. Texels outside a partial edge
+// block repeat the last real column or row, so the encoder never fits
+// endpoints to whatever happened to be in memory.
+static void
+decodeBcLevel(const uint8 *blocks, uint32 width, uint32 height,
+              VkFormat format, uint8 *rgba)
+{
+	const uint32 blockBytes = bcBlockBytes(format);
+	const uint32 across = (width+3)/4, down = (height+3)/4;
+	uint8 texels[16*4];
+	for(uint32 by = 0; by < down; by++){
+		for(uint32 bx = 0; bx < across; bx++){
+			decodeBcBlock(blocks+((size_t)by*across+bx)*blockBytes,
+				format, texels);
+			for(uint32 y = 0; y < 4; y++){
+				const uint32 py = by*4+y;
+				if(py >= height) break;
+				for(uint32 x = 0; x < 4; x++){
+					const uint32 px = bx*4+x;
+					if(px >= width) break;
+					for(int c = 0; c < 4; c++)
+						rgba[((size_t)py*width+px)*4+c] =
+							texels[(y*4+x)*4+c];
+				}
+			}
+		}
+	}
+}
+
+static void
+encodeBcLevel(const uint8 *rgba, uint32 width, uint32 height,
+              VkFormat format, uint8 *blocks)
+{
+	const uint32 blockBytes = bcBlockBytes(format);
+	const uint32 across = (width+3)/4, down = (height+3)/4;
+	uint8 texels[16*4];
+	for(uint32 by = 0; by < down; by++){
+		for(uint32 bx = 0; bx < across; bx++){
+			for(uint32 y = 0; y < 4; y++){
+				uint32 py = by*4+y;
+				if(py >= height) py = height-1;
+				for(uint32 x = 0; x < 4; x++){
+					uint32 px = bx*4+x;
+					if(px >= width) px = width-1;
+					for(int c = 0; c < 4; c++)
+						texels[(y*4+x)*4+c] =
+							rgba[((size_t)py*width+px)*4+c];
+				}
+			}
+			encodeBcBlock(texels, format,
+				blocks+((size_t)by*across+bx)*blockBytes);
+		}
+	}
+}
+
+static VkDeviceSize
+bcLevelBytes(uint32 width, uint32 height, VkFormat format)
+{
+	return (VkDeviceSize)((width+3)/4)*((height+3)/4)*bcBlockBytes(format);
+}
+
 static bool32
 dxt1BlocksHaveTransparency(const uint8 *blocks, uint32 size)
 {
@@ -328,6 +877,308 @@ dxt1BlocksHaveTransparency(const uint8 *blocks, uint32 size)
 // reports full BC support, so stream data reaches the GPU the same way the
 // desktop D3D12 build uploads it. Decoding on the CPU instead cost
 // milliseconds per streamed texture, which surfaced as frame drops -- the
+// Builds the chain from a copy of the base blocks into its own buffer, off
+// the game's threads. Each level is decoded from the one above it, filtered
+// with the same alpha weighting the uncompressed path uses, and encoded
+// again. False means nothing was written and the levels stay unused.
+static bool32
+buildCompressedMips(const uint8 *base, uint8 *out, uint32 baseWidth,
+                    uint32 baseHeight, VkFormat format, int32 numLevels)
+{
+	// Two scratch levels, ping-ponged: the one being read and the one being
+	// written. Kept between textures and grown to the largest seen -- the
+	// game streams these continuously, and a pair of multi-megabyte
+	// allocations per texture was a good part of the cost.
+	const size_t pixels = (size_t)baseWidth*baseHeight*4;
+	if(pixels > gMipScratchBytes){
+		rwFree(gMipScratch[0]);
+		rwFree(gMipScratch[1]);
+		gMipScratch[0] = (uint8*)rwMalloc(pixels, MEMDUR_GLOBAL | ID_IMAGE);
+		gMipScratch[1] = (uint8*)rwMalloc(pixels, MEMDUR_GLOBAL | ID_IMAGE);
+		gMipScratchBytes = gMipScratch[0] && gMipScratch[1] ? pixels : 0;
+	}
+	uint8 *previous = gMipScratch[0];
+	uint8 *current = gMipScratch[1];
+	if(previous == nil || current == nil)
+		return 0;
+
+	decodeBcLevel(base, baseWidth, baseHeight, format, previous);
+	uint32 sourceWidth = baseWidth, sourceHeight = baseHeight;
+	VkDeviceSize offset = 0;
+	for(int32 level = 1; level < numLevels; level++){
+		const uint32 width = levelDimension(baseWidth, level);
+		const uint32 height = levelDimension(baseHeight, level);
+		downsampleLevel(previous, sourceWidth, sourceHeight,
+			current, width, height, VK_FORMAT_R8G8B8A8_UNORM, 4);
+		encodeBcLevel(current, width, height, format, out+offset);
+		offset += alignLevel(bcLevelBytes(width, height, format));
+		uint8 *swap = previous; previous = current; current = swap;
+		sourceWidth = width;
+		sourceHeight = height;
+	}
+	return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Deferred mip generation
+//
+// Filtering and re-encoding a texture costs a few milliseconds, and the game
+// streams textures continuously while the player drives. Doing it where the
+// texture is created put every one of those milliseconds on the streaming
+// thread: standing still was fine, turning a corner into unseen ground was a
+// stall. The base level goes up immediately, the chain is built on a worker,
+// and the finished levels are uploaded on the next frame that asks for them.
+//
+// Until they land the view exposes level 0 alone, so nothing ever samples a
+// level that has not been written.
+// ---------------------------------------------------------------------------
+
+struct GeneratedMipJob
+{
+	VulkanRaster *native;
+	VkFormat format;
+	uint32 width;
+	uint32 height;
+	int32 numLevels;
+	uint8 *source;
+	uint8 *result;
+	VkDeviceSize resultBytes;
+	bool cancelled;
+};
+
+static std::mutex gMipMutex;
+static std::condition_variable gMipSignal;
+static std::deque<GeneratedMipJob*> gMipPending;
+static std::deque<GeneratedMipJob*> gMipFinished;
+static std::thread gMipWorker;
+static bool gMipWorkerStarted;
+static bool gMipWorkerStop;
+
+static void
+freeMipJob(GeneratedMipJob *job)
+{
+	rwFree(job->source);
+	rwFree(job->result);
+	rwFree(job);
+}
+
+static void
+mipWorkerBody(void)
+{
+	for(;;){
+		GeneratedMipJob *job = nil;
+		{
+			std::unique_lock<std::mutex> lock(gMipMutex);
+			gMipSignal.wait(lock, []{
+				return gMipWorkerStop || !gMipPending.empty();
+			});
+			if(gMipWorkerStop && gMipPending.empty())
+				return;
+			job = gMipPending.front();
+			gMipPending.pop_front();
+			if(job->cancelled){
+				job->native = nil;
+				freeMipJob(job);
+				continue;
+			}
+		}
+		const uint64 startedAt = microseconds();
+		buildCompressedMips(job->source, job->result, job->width,
+			job->height, job->format, job->numLevels);
+		gMipMicroseconds += microseconds()-startedAt;
+		{
+			std::lock_guard<std::mutex> lock(gMipMutex);
+			gMipFinished.push_back(job);
+		}
+	}
+}
+
+// Takes the lock itself: a raster can be destroyed from anywhere, and the
+// worker may be holding the job it is about to disown.
+static void
+cancelGeneratedMips(VulkanRaster *native)
+{
+	std::lock_guard<std::mutex> lock(gMipMutex);
+	for(size_t i = 0; i < gMipPending.size(); i++)
+		if(gMipPending[i]->native == native){
+			gMipPending[i]->cancelled = true;
+			gMipPending[i]->native = nil;
+		}
+	for(size_t i = 0; i < gMipFinished.size(); i++)
+		if(gMipFinished[i]->native == native){
+			gMipFinished[i]->cancelled = true;
+			gMipFinished[i]->native = nil;
+		}
+}
+
+static void
+queueGeneratedMips(VulkanRaster *native, VkFormat format, uint32 width,
+                   uint32 height, int32 numLevels, const uint8 *blocks,
+                   VkDeviceSize sourceBytes)
+{
+	VkDeviceSize resultBytes = 0;
+	for(int32 level = 1; level < numLevels; level++)
+		resultBytes += alignLevel(bcLevelBytes(levelDimension(width, level),
+			levelDimension(height, level), format));
+	if(resultBytes == 0)
+		return;
+
+	GeneratedMipJob *job =
+		(GeneratedMipJob*)rwMalloc(sizeof(GeneratedMipJob),
+			MEMDUR_GLOBAL | ID_IMAGE);
+	if(job == nil)
+		return;
+	memset(job, 0, sizeof(*job));
+	job->native = native;
+	job->format = format;
+	job->width = width;
+	job->height = height;
+	job->numLevels = numLevels;
+	job->resultBytes = resultBytes;
+	job->source = (uint8*)rwMalloc((size_t)sourceBytes,
+		MEMDUR_GLOBAL | ID_IMAGE);
+	job->result = (uint8*)rwMalloc((size_t)resultBytes,
+		MEMDUR_GLOBAL | ID_IMAGE);
+	if(job->source == nil || job->result == nil){
+		freeMipJob(job);
+		return;
+	}
+	memcpy(job->source, blocks, (size_t)sourceBytes);
+
+	std::lock_guard<std::mutex> lock(gMipMutex);
+	if(!gMipWorkerStarted){
+		gMipWorkerStarted = true;
+		gMipWorker = std::thread(mipWorkerBody);
+	}
+	gMipPending.push_back(job);
+	gMipSignal.notify_one();
+}
+
+// The finished levels, uploaded from the thread that owns the command
+// buffer. That is the same thread the game streams and evicts textures on,
+// which is what makes it safe to touch a job's raster after the queue lock
+// is released: nothing can destroy it in between. Bounded per call, so a
+// burst of streamed textures does not turn into one long frame at this end
+// either.
+void
+uploadFinishedMips(void)
+{
+	for(int handled = 0; handled < 8; handled++){
+		GeneratedMipJob *job = nil;
+		{
+			std::lock_guard<std::mutex> lock(gMipMutex);
+			if(gMipFinished.empty())
+				return;
+			job = gMipFinished.front();
+			gMipFinished.pop_front();
+		}
+		if(job->cancelled || job->native == nil){
+			freeMipJob(job);
+			continue;
+		}
+		VulkanRaster *native = job->native;
+
+		VkBuffer staging = VK_NULL_HANDLE;
+		VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+		if(!createBuffer(job->resultBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                 &staging, &stagingMemory)){
+			freeMipJob(job);
+			continue;
+		}
+		void *mapped = nil;
+		vkMapMemory(gvk.device, stagingMemory, 0, job->resultBytes, 0, &mapped);
+		memcpy(mapped, job->result, (size_t)job->resultBytes);
+		vkUnmapMemory(gvk.device, stagingMemory);
+
+		VkCommandBuffer commandBuffer = beginOneShot();
+		if(commandBuffer == VK_NULL_HANDLE){
+			retireBuffer(staging, stagingMemory);
+			freeMipJob(job);
+			continue;
+		}
+		transitionImageLayout(commandBuffer, native->image,
+		                      VK_IMAGE_ASPECT_COLOR_BIT,
+		                      (uint32)job->numLevels,
+		                      native->layout,
+		                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		VkDeviceSize offset = 0;
+		for(int32 level = 1; level < job->numLevels; level++){
+			const uint32 width = levelDimension(job->width, level);
+			const uint32 height = levelDimension(job->height, level);
+			VkBufferImageCopy region = {};
+			region.bufferOffset = offset;
+			region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			region.imageSubresource.mipLevel = (uint32)level;
+			region.imageSubresource.layerCount = 1;
+			region.imageExtent.width = width;
+			region.imageExtent.height = height;
+			region.imageExtent.depth = 1;
+			vkCmdCopyBufferToImage(commandBuffer, staging, native->image,
+				VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+			offset += alignLevel(bcLevelBytes(width, height, job->format));
+		}
+		transitionImageLayout(commandBuffer, native->image,
+		                      VK_IMAGE_ASPECT_COLOR_BIT,
+		                      (uint32)job->numLevels,
+		                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		endOneShot(commandBuffer);
+		native->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		retireBuffer(staging, stagingMemory);
+
+		// Only now may anything sample past level 0. The old view is retired
+		// with the frame; the cached descriptors are forced to be rewritten
+		// against the new one.
+		VkImageViewCreateInfo viewInfo = {};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = native->image;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = job->format;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.levelCount = (uint32)job->numLevels;
+		viewInfo.subresourceRange.layerCount = 1;
+		VkImageView view = VK_NULL_HANDLE;
+		if(vkCreateImageView(gvk.device, &viewInfo, nil, &view) == VK_SUCCESS){
+			retireImage(native->view, VK_NULL_HANDLE, VK_NULL_HANDLE);
+			native->view = view;
+			for(int frame = 0; frame < NUM_FRAME_CONTEXTS; frame++)
+				native->samplerKey[frame] = 0xFFFFFFFFu;
+			gMipLanded++;
+		}
+		freeMipJob(job);
+	}
+}
+
+void
+stopGeneratedMips(void)
+{
+	{
+		std::lock_guard<std::mutex> lock(gMipMutex);
+		if(!gMipWorkerStarted)
+			return;
+		gMipWorkerStop = true;
+	}
+	gMipSignal.notify_all();
+	gMipWorker.join();
+	gMipWorkerStarted = false;
+	gMipWorkerStop = false;
+	rwFree(gMipScratch[0]);
+	rwFree(gMipScratch[1]);
+	gMipScratch[0] = gMipScratch[1] = nil;
+	gMipScratchBytes = 0;
+	std::lock_guard<std::mutex> lock(gMipMutex);
+	while(!gMipPending.empty()){
+		freeMipJob(gMipPending.front());
+		gMipPending.pop_front();
+	}
+	while(!gMipFinished.empty()){
+		freeMipJob(gMipFinished.front());
+		gMipFinished.pop_front();
+	}
+}
+
 // world lurching -- whenever driving streamed new map sectors in.
 Raster *
 rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
@@ -358,6 +1209,14 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	VulkanRaster *native = GETVULKANRASTER(raster);
 	native->format = format;
 	native->numLevels = 1;
+	native->generateMips = wantsGeneratedMips(raster, format);
+	if(native->generateMips){
+		uint32 extent = (uint32)(width > height ? width : height);
+		while(extent > 1){
+			extent >>= 1;
+			native->numLevels++;
+		}
+	}
 	const bool32 blockAlpha =
 		dxt == 1 && dxt1BlocksHaveTransparency(blocks, size);
 	native->hasAlpha = hasAlpha || blockAlpha;
@@ -377,7 +1236,7 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	imageInfo.extent.width = (uint32)width;
 	imageInfo.extent.height = (uint32)height;
 	imageInfo.extent.depth = 1;
-	imageInfo.mipLevels = 1;
+	imageInfo.mipLevels = (uint32)native->numLevels;
 	imageInfo.arrayLayers = 1;
 	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -415,6 +1274,7 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
 	viewInfo.format = format;
 	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	// Level 0 is all that exists until the worker comes back.
 	viewInfo.subresourceRange.levelCount = 1;
 	viewInfo.subresourceRange.layerCount = 1;
 	if(vkCreateImageView(gvk.device, &viewInfo, nil, &native->view) != VK_SUCCESS){
@@ -422,24 +1282,28 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 		return nil;
 	}
 
+	const VkDeviceSize stagingSize = size;
+
 	VkBuffer staging = VK_NULL_HANDLE;
 	VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-	if(!createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	if(!createBuffer(stagingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 	                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 	                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 	                 &staging, &stagingMemory)){
 		raster->destroy();
 		return nil;
 	}
-	void *mapped = nil;
-	vkMapMemory(gvk.device, stagingMemory, 0, size, 0, &mapped);
+	uint8 *mapped = nil;
+	vkMapMemory(gvk.device, stagingMemory, 0, stagingSize, 0,
+	            (void**)&mapped);
 	memcpy(mapped, blocks, size);
 	vkUnmapMemory(gvk.device, stagingMemory);
 
 	VkCommandBuffer commandBuffer = beginOneShot();
 	if(commandBuffer != VK_NULL_HANDLE){
 		transitionImageLayout(commandBuffer, native->image,
-		                      VK_IMAGE_ASPECT_COLOR_BIT, 1,
+		                      VK_IMAGE_ASPECT_COLOR_BIT,
+		                      (uint32)native->numLevels,
 		                      VK_IMAGE_LAYOUT_UNDEFINED,
 		                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 		VkBufferImageCopy region = {};
@@ -449,9 +1313,10 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 		region.imageExtent.height = (uint32)height;
 		region.imageExtent.depth = 1;
 		vkCmdCopyBufferToImage(commandBuffer, staging, native->image,
-		                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 		transitionImageLayout(commandBuffer, native->image,
-		                      VK_IMAGE_ASPECT_COLOR_BIT, 1,
+		                      VK_IMAGE_ASPECT_COLOR_BIT,
+		                      (uint32)native->numLevels,
 		                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 		endOneShot(commandBuffer);
@@ -460,6 +1325,10 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	// endOneShot is asynchronous during a live frame. The active frame fence
 	// retires this staging allocation after both the copy and its consumers.
 	retireBuffer(staging, stagingMemory);
+
+	if(native->numLevels > 1)
+		queueGeneratedMips(native, format, (uint32)width, (uint32)height,
+			native->numLevels, blocks, size);
 
 	return raster;
 }
@@ -496,13 +1365,19 @@ rasterLock(Raster *raster, int32 level, int32 lockMode)
 	const uint32 height = levelDimension((uint32)raster->height, level);
 	const uint32 bytesPerPixel = (uint32)(raster->depth / 8);
 	const VkDeviceSize size = (VkDeviceSize)width * height * bytesPerPixel;
+	// The generated chain rides behind the base in this same allocation.
+	const VkDeviceSize total = size +
+		(native->generateMips && level == 0 ?
+			alignLevel(size)-size +
+			generatedMipBytes(native->numLevels, width, height,
+				bytesPerPixel) : 0);
 
-	if(!createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	if(!createBuffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 	                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 	                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 	                 &native->stagingBuffer, &native->stagingMemory))
 		return nil;
-	if(vkMapMemory(gvk.device, native->stagingMemory, 0, size, 0,
+	if(vkMapMemory(gvk.device, native->stagingMemory, 0, total, 0,
 	               (void**)&native->stagingMapped) != VK_SUCCESS){
 		vkDestroyBuffer(gvk.device, native->stagingBuffer, nil);
 		vkFreeMemory(gvk.device, native->stagingMemory, nil);
@@ -524,6 +1399,48 @@ rasterLock(Raster *raster, int32 level, int32 lockMode)
 	return native->stagingMapped;
 }
 
+// Fills levels 1..n from the base the game just wrote, and queues each one
+// out of the same buffer.
+static void
+uploadGeneratedMips(VulkanRaster *native, uint32 baseWidth, uint32 baseHeight,
+                    uint32 bytesPerPixel, VkCommandBuffer commandBuffer)
+{
+	if(native->stagingMapped == nil || bytesPerPixel == 0)
+		return;
+	const VkDeviceSize baseBytes =
+		alignLevel((VkDeviceSize)baseWidth*baseHeight*bytesPerPixel);
+
+	// Each level is filtered from the one above it, so the chain is walked in
+	// order and the previous result stays addressable.
+	const uint8 *source = native->stagingMapped;
+	uint32 sourceWidth = baseWidth, sourceHeight = baseHeight;
+	VkDeviceSize offset = baseBytes;
+	for(int32 level = 1; level < native->numLevels; level++){
+		const uint32 width = levelDimension(baseWidth, level);
+		const uint32 height = levelDimension(baseHeight, level);
+		uint8 *destination = native->stagingMapped+offset;
+		downsampleLevel(source, sourceWidth, sourceHeight,
+			destination, width, height, native->format, bytesPerPixel);
+
+		VkBufferImageCopy region = {};
+		region.bufferOffset = offset;
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.mipLevel = (uint32)level;
+		region.imageSubresource.layerCount = 1;
+		region.imageExtent.width = width;
+		region.imageExtent.height = height;
+		region.imageExtent.depth = 1;
+		vkCmdCopyBufferToImage(commandBuffer, native->stagingBuffer,
+			native->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+		source = destination;
+		sourceWidth = width;
+		sourceHeight = height;
+		offset += alignLevel((VkDeviceSize)width*height*bytesPerPixel);
+	}
+}
+
+
 void
 rasterUnlock(Raster *raster, int32 level)
 {
@@ -531,8 +1448,10 @@ rasterUnlock(Raster *raster, int32 level)
 	if(native->lockedLevel < 0 || native->stagingBuffer == VK_NULL_HANDLE)
 		return;
 
-	const uint32 width = levelDimension((uint32)raster->width, 0);
-	const uint32 height = levelDimension((uint32)raster->height, 0);
+	// rasterLock narrowed these to the locked level before handing the
+	// staging pointer out, so they are already this level's extent.
+	const uint32 width = (uint32)raster->width;
+	const uint32 height = (uint32)raster->height;
 
 	VkCommandBuffer commandBuffer = beginOneShot();
 	if(commandBuffer != VK_NULL_HANDLE){
@@ -554,6 +1473,9 @@ rasterUnlock(Raster *raster, int32 level)
 		vkCmdCopyBufferToImage(commandBuffer, native->stagingBuffer, native->image,
 		                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
+		if(native->generateMips && level == 0 && native->numLevels > 1)
+			uploadGeneratedMips(native, width, height,
+				(uint32)(raster->depth/8), commandBuffer);
 		transitionImageLayout(commandBuffer, native->image,
 		                      VK_IMAGE_ASPECT_COLOR_BIT,
 		                      (uint32)native->numLevels,

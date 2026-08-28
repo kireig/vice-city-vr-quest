@@ -760,13 +760,14 @@ diff --git a/src/peds/PlayerPed.cpp b/src/peds/PlayerPed.cpp
 diff --git a/src/peds/Ped.cpp b/src/peds/Ped.cpp
 --- a/src/peds/Ped.cpp
 +++ b/src/peds/Ped.cpp
-@@ -42,6 +42,12 @@
+@@ -42,6 +42,13 @@
  #include "Wanted.h"
  #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
  #include "OculusVR.h"
 +#if defined(RW_VULKAN) && defined(__ANDROID__)
 +namespace androidgame {
 +bool VrUsesHeadRelativeMovement(void);
++void *VrCutsceneCameraActor(void);
 +}
 +#include <android/log.h>
 +#endif

@@ -33,6 +33,11 @@ struct VulkanRaster
 	uint32 lockedFlags;
 
 	int32 numLevels;
+	// Vice City ships its world textures with a single level, so the far
+	// half of every fence, sign and railing was being minified straight
+	// off the full-size image. Set when the chain was allocated for a
+	// texture that arrived without one and has to be filled in here.
+	bool32 generateMips;
 	bool32 hasAlpha;
 	bool32 isCompressed;
 	// Set when the source was a DXT/BC texture that this device cannot sample
@@ -59,6 +64,11 @@ struct RenderState
 	uint32 cullMode;
 	uint32 alphaTestFunction;
 	uint32 alphaTestRef;
+	// The PS2 two-pass alpha rule. The game asks for it -- reVC sets it
+	// from gPS2alphaTest every frame -- and this backend was the only one
+	// dropping it on the floor; d3d9 and gl3 have carried it all along.
+	uint32 gsAlphaTest;
+	uint32 gsAlphaTestRef;
 	uint32 fogEnabled;
 	RGBA fogColor;
 	// Set through SetRenderStatePtr(TEXTURERASTER). Immediate mode reads it
@@ -209,6 +219,9 @@ struct Globals
 	bool32 initialised;
 	bool32 inFrame;
 	bool32 supportsBC;
+	// Off unless the port asks for it: the game's own TXDs decide how
+	// many levels a texture has, and building the rest costs memory.
+	bool32 generateMipmaps;
 
 	float32 stereoViewProjection[2][16];
 	// Exact OpenXR matrices before temporal projection jitter. SGSR2 motion

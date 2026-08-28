@@ -206,7 +206,28 @@ diff --git a/src/core/Pad.cpp b/src/core/Pad.cpp
 diff --git a/src/peds/Ped.cpp b/src/peds/Ped.cpp
 --- a/src/peds/Ped.cpp
 +++ b/src/peds/Ped.cpp
-@@ -4850,6 +4850,28 @@
+@@ -839,6 +839,20 @@
+ 				return CPedType::GetFlag(shooter->m_nPedType);
+ 			}
+ 		}
++#if defined(GTA_VR_WEAPONS) && defined(RW_VULKAN) && defined(__ANDROID__)
++		// Aimed at rather than shot at. Everyone treats that as a gun
++		// going off nearby, which is what the reaction was written for:
++		// CCivilianPed sorts out who runs and who draws, and a gang
++		// member draws.
++		CPed *aiming = CheckForAimedGun();
++		if (aiming) {
++			if (m_threatEntity)
++				m_threatEntity->CleanUpOldReference(&m_threatEntity);
++			m_threatEntity = aiming;
++			m_threatEntity->RegisterReference((CEntity**)&m_threatEntity);
++			return PED_FLAG_GUN;
++		}
++#endif
+ 	}
+ 
+ 	CPed *deadPed;
+@@ -4850,6 +4876,31 @@
  		RwMatrixScale(head, &zero, rwCOMBINEPRECONCAT);
  	}
  
@@ -221,8 +242,11 @@ diff --git a/src/peds/Ped.cpp b/src/peds/Ped.cpp
 +		extern bool gVrInVehicle;
 +		extern bool gVrHidePlayerBody;
 +		extern CEntity *gVrPlayerEntity;
-+		if (gVrFirstPersonActive && gVrInVehicle && !gVrHidePlayerBody &&
-+		    (CEntity*)this == gVrPlayerEntity) {
++		// A cutscene camera parked on this ped is the same problem: the
++		// eye is inside the head, so the head has to go for the draw.
++		if ((gVrFirstPersonActive && gVrInVehicle && !gVrHidePlayerBody &&
++		     (CEntity*)this == gVrPlayerEntity) ||
++		    androidgame::VrCutsceneCameraActor() == (void*)this) {
 +			RpHAnimHierarchy* hier = GetAnimHierarchyFromSkinClump(GetClump());
 +			int32 idx = RpHAnimIDGetIndex(hier, ConvertPedNode2BoneTag(PED_HEAD));
 +			RwMatrix* head = &RpHAnimHierarchyGetMatrixArray(hier)[idx];
@@ -235,6 +259,75 @@ diff --git a/src/peds/Ped.cpp b/src/peds/Ped.cpp
  	if (IsPlayer() && gfTommyFatness != 1.0f) {
  		RpHAnimHierarchy* hier = GetAnimHierarchyFromSkinClump(GetClump());
  		int32 idx;
+@@ -7651,6 +7690,55 @@
+ 	return false;
+ }
+ 
++#if defined(GTA_VR_WEAPONS) && defined(RW_VULKAN) && defined(__ANDROID__)
++// A gun pointed at you is a threat before it goes off, and in VR that is
++// most of what pointing one is for: the barrel goes wherever the hand
++// goes, and the scan above only hears shots, so a ped could be lined up
++// at arm's length and never notice.
++//
++// The ray is worked out once a frame for the whole world. What is left
++// here is a few dot products on values the ped already holds, cheapest
++// first, and a line of sight that only runs for the one ped the barrel
++// is actually on.
++CPed *
++CPed::CheckForAimedGun(void)
++{
++	CVector source, direction;
++	if (!OculusVR::GetHeldTrackedWeaponAim(&source, &direction))
++		return nil;
++
++	CPlayerPed *player = FindPlayerPed();
++	if (player == nil || player == this || player->DyingOrDead())
++		return nil;
++
++	// A ped origin already sits at chest height, FEET_OFFSET above the
++	// ground, so the body is the metre or so around it.
++	CVector toUs = GetPosition() - source;
++	const float along = DotProduct(toUs, direction);
++	if (along < 0.5f || along > 25.0f)
++		return nil;
++	// How far the barrel misses by, in metres rather than degrees: a
++	// wave of the hand should not pick someone out down the street, but
++	// across a pavement the whole body counts. Wide enough to cover a
++	// torso, tall enough to cover the rest of the ped.
++	const CVector miss = toUs - along*direction;
++	if (miss.x*miss.x + miss.y*miss.y > sq(0.5f) || Abs(miss.z) > 0.8f)
++		return nil;
++
++	// And the ped has to be facing us. Nobody is frightened by a barrel at
++	// their back, and a ped's own view cone is all the seeing this
++	// needs before the line of sight is worth paying for.
++	CVector2D toPlayer = CVector2D(source) - CVector2D(GetPosition());
++	toPlayer.Normalise();
++	if (DotProduct2D(toPlayer, CVector2D(GetForward())) < 0.5f)
++		return nil;
++
++	if (!OurPedCanSeeThisOne(player, true))
++		return nil;
++	return player;
++}
++#endif
++
+ CPed *
+ CPed::CheckForGunShots(void)
+ {
+diff --git a/src/peds/Ped.h b/src/peds/Ped.h
+--- a/src/peds/Ped.h
++++ b/src/peds/Ped.h
+@@ -734,6 +734,9 @@
+ 	CPed *CheckForDeadPeds(void);
+ 	bool CheckForExplosions(CVector2D &area);
+ 	CPed *CheckForGunShots(void);
++#if defined(GTA_VR_WEAPONS) && defined(RW_VULKAN) && defined(__ANDROID__)
++	CPed *CheckForAimedGun(void);
++#endif
+ 	uint8 CheckForPointBlankPeds(CPed*);
+ 	bool CheckIfInTheAir(void);
+ 	void ClearAll(void);
 diff --git a/src/render/Hud.cpp b/src/render/Hud.cpp
 --- a/src/render/Hud.cpp
 +++ b/src/render/Hud.cpp
@@ -1015,6 +1108,19 @@ diff --git a/src/render/Font.cpp b/src/render/Font.cpp
  	   weapon->m_eWeaponType == WEAPONTYPE_CAMERA ||
  	   weapon->m_eWeaponType == WEAPONTYPE_FLAMETHROWER ||
  	   weapon->m_eWeaponType == WEAPONTYPE_MINIGUN ||
+@@ -3060,6 +3060,12 @@
+ #ifdef CUTSCENE_BORDERS_SWITCH
+ 		&& CMenuManager::m_PrefsCutsceneBorders
+ #endif
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++		// The letterbox is a frame around a picture. Once the shot is
++		// rendered in stereo there is no picture to frame, only two black
++		// bars welded across the player's eyes.
++		&& androidgame::VrCutsceneMode() == 0
++#endif
+ 		)
+ 		TheCamera.DrawBordersForWideScreen();
+ 
 --- a/src/vehicles/Boat.cpp
 +++ b/src/vehicles/Boat.cpp
 @@ -29,6 +29,9 @@
@@ -1043,4 +1149,95 @@ diff --git a/src/render/Font.cpp b/src/render/Font.cpp
 +#endif
  	m_fSteeringLeftRight += (-CPad::GetPad(pad)->GetSteeringLeftRight()/128.0f - m_fSteeringLeftRight)*0.2f;
  	m_fSteeringLeftRight = clamp(m_fSteeringLeftRight, -1.0f, 1.0f);
+ 
+--- a/src/animation/CutsceneMgr.h
++++ b/src/animation/CutsceneMgr.h
+@@ -35,6 +35,10 @@
+ 	static bool WasCutsceneSkipped(void) { return ms_wasCutsceneSkipped; }
+ 	static bool UseLodMultiplier(void) { return ms_useLodMultiplier; }
+ 	static CCutsceneObject* GetCutsceneObject(int id) { return ms_pCutsceneObjects[id]; }
++	// Only the first few slots hold this scene's actors. The array keeps
++	// whatever the previous cutscene left behind, so anything walking it
++	// has to stop here or it picks up a parked actor from another scene.
++	static int32 GetNumCutsceneObjects(void) { return ms_numCutsceneObjs; }
+ 	static int GetCutsceneTimeInMilleseconds(void) { return 1000.0f * ms_cutsceneTimer; }
+ 	static char *GetCutsceneName(void) { return ms_cutsceneName; }
+ 	static void SetCutsceneOffset(const CVector& vec) { ms_cutsceneOffset = vec; }
+--- a/src/objects/CutsceneObject.cpp
++++ b/src/objects/CutsceneObject.cpp
+@@ -5,6 +5,10 @@
+ #include "Lights.h"
+ #include "PointLights.h"
+ #include "RpAnimBlend.h"
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++#include "Bones.h"
++#include "android.h"
++#endif
+ #include "AnimBlendClumpData.h"
+ #include "Bones.h"
+ #include "Renderer.h"
+@@ -228,7 +232,64 @@
+ CCutsceneObject::Render(void)
+ {
+ 	SetCullMode(rwCULLMODECULLNONE);
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	// Filming this actor from inside their own head puts the back of
++	// their face across the view. Collapse the head for the draw and put
++	// it back afterwards: the body, and everyone else, stay whole.
++	//
++	// The head bone alone is not the whole head. A cutscene actor carries
++	// jaw and eye bones under it for the lip sync, and those hang off the
++	// hierarchy with matrices of their own, so collapsing the parent once
++	// the pose is built leaves the eyes and the mouth floating where the
++	// face was. The whole branch has to go, which means walking the node
++	// list the way the bone table does: depth first, with a parent stack.
++	enum { MAX_ACTOR_BONES = 64 };
++	RwMatrix savedBones[MAX_ACTOR_BONES];
++	int collapsedBones[MAX_ACTOR_BONES];
++	RwMatrix *boneMatrices = nil;
++	int collapsed = 0;
++	if(androidgame::VrCutsceneCameraActor() == this && m_rwObject &&
++	   RwObjectGetType(m_rwObject) == rpCLUMP &&
++	   IsClumpSkinned((RpClump*)m_rwObject)){
++		RpHAnimHierarchy *hierarchy =
++			GetAnimHierarchyFromSkinClump((RpClump*)m_rwObject);
++		if(hierarchy && hierarchy->numNodes > 0 &&
++		   hierarchy->numNodes <= MAX_ACTOR_BONES)
++			boneMatrices = RpHAnimHierarchyGetMatrixArray(hierarchy);
++		if(boneMatrices){
++			bool inHead[MAX_ACTOR_BONES];
++			int stack[32];
++			int sp = 0;
++			int parent = 0;
++			inHead[0] = false;
++			for(int node = 0; node < hierarchy->numNodes; node++){
++				const int flags = hierarchy->nodeInfo[node].flags;
++				if(node > 0)
++					inHead[node] = inHead[parent];
++				if(hierarchy->nodeInfo[node].id == BONE_head)
++					inHead[node] = true;
++				if(flags & rpHANIMPUSHPARENTMATRIX && sp < 32)
++					stack[sp++] = parent;
++				parent = node;
++				if(flags & rpHANIMPOPPARENTMATRIX && sp > 0)
++					parent = stack[--sp];
++			}
++			RwV3d zero = { 0.0f, 0.0f, 0.0f };
++			for(int node = 0; node < hierarchy->numNodes; node++)
++				if(inHead[node]){
++					savedBones[collapsed] = boneMatrices[node];
++					collapsedBones[collapsed++] = node;
++					RwMatrixScale(&boneMatrices[node], &zero,
++						rwCOMBINEPRECONCAT);
++				}
++		}
++	}
++#endif
+ 	CObject::Render();
++#if defined(RW_VULKAN) && defined(__ANDROID__)
++	for(int i = 0; i < collapsed; i++)
++		boneMatrices[collapsedBones[i]] = savedBones[i];
++#endif
+ 	SetCullMode(rwCULLMODECULLBACK);
+ }
  

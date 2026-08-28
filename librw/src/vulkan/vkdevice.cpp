@@ -3064,6 +3064,42 @@ setFxaaEnabled(bool32 enabled)
 	gvk.postFxConstants.mode[1] = enabled ? 1u : 0u;
 }
 
+static bool32 gPs2AlphaTestEnabled = 1;
+
+void
+setPs2AlphaTestEnabled(bool32 enabled)
+{
+	gPs2AlphaTestEnabled = enabled;
+}
+
+bool32
+getPs2AlphaTestEnabled(void)
+{
+	return gPs2AlphaTestEnabled;
+}
+
+static bool32 gRenderDiagnostics;
+
+void
+setRenderDiagnostics(bool32 enabled)
+{
+	gRenderDiagnostics = enabled;
+}
+
+bool32
+renderDiagnosticsEnabled(void)
+{
+	return gRenderDiagnostics;
+}
+
+void
+setGenerateMipmaps(bool32 enabled)
+{
+	if(gvk.generateMipmaps != enabled && gRenderDiagnostics)
+		VKLOG("generated mipmaps %s", enabled ? "on" : "off");
+	gvk.generateMipmaps = enabled;
+}
+
 void
 setSpatialAaMode(uint32 mode)
 {
@@ -3181,6 +3217,8 @@ setRenderState(int32 state, void *value)
 	case CULLMODE:         gstate.cullMode = v; break;
 	case ALPHATESTFUNC:    gstate.alphaTestFunction = v; break;
 	case ALPHATESTREF:     gstate.alphaTestRef = v; break;
+	case GSALPHATEST:      gstate.gsAlphaTest = v; break;
+	case GSALPHATESTREF:   gstate.gsAlphaTestRef = v; break;
 	case FOGENABLE:        gstate.fogEnabled = v; break;
 	case FOGCOLOR: {
 		RGBA c;
@@ -3212,6 +3250,8 @@ getRenderState(int32 state)
 	case CULLMODE:         v = gstate.cullMode; break;
 	case ALPHATESTFUNC:    v = gstate.alphaTestFunction; break;
 	case ALPHATESTREF:     v = gstate.alphaTestRef; break;
+	case GSALPHATEST:      v = gstate.gsAlphaTest; break;
+	case GSALPHATESTREF:   v = gstate.gsAlphaTestRef; break;
 	case FOGENABLE:        v = gstate.fogEnabled; break;
 	case FOGCOLOR:
 		memcpy(&v, &gstate.fogColor, sizeof(v));
@@ -3239,6 +3279,8 @@ resetRenderState(void)
 	gstate.cullMode = CULLBACK;
 	gstate.alphaTestFunction = ALPHAGREATEREQUAL;
 	gstate.alphaTestRef = 128;
+	gstate.gsAlphaTest = 0;
+	gstate.gsAlphaTestRef = 128;
 	gstate.textureFilter = Texture::LINEAR;
 	gstate.textureAddressU = Texture::WRAP;
 	gstate.textureAddressV = Texture::WRAP;
@@ -3473,6 +3515,7 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 	}
 
 	case DEVICECLOSE:
+		stopGeneratedMips();
 		if(gvk.device != VK_NULL_HANDLE){
 			vkDeviceWaitIdle(gvk.device);
 			resetAtomicMotionHistory();

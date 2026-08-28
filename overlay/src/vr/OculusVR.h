@@ -10,7 +10,7 @@ class CVehicle;
 
 // Single source of truth for the build name shown to players: the flat main
 // menu, the VR About page and the APK version must never disagree again.
-#define MIAMIVR_VERSION_TEXT "0.5.2 (0.5.3 RC4)"
+#define MIAMIVR_VERSION_TEXT "0.5.3"
 
 namespace OculusVR
 {
@@ -122,6 +122,9 @@ void BeginTrackedWeaponFire(int hand, int weaponType, const CVector &source,
 	const CVector &direction);
 void EndTrackedWeaponFire();
 bool GetActiveTrackedWeaponAim(CVector *source, CVector *direction);
+// Where the held weapon points this frame, for anything that has to
+// know it is being aimed at.
+bool GetHeldTrackedWeaponAim(CVector *source, CVector *direction);
 bool GetActiveTrackedThrowableLaunch(CVector *source, CVector *velocity);
 void ReleaseTrackedWeaponAfterUse(int hand, int slot);
 bool GetTrackedHandMatrix(int hand, CMatrix *handMatrix, float *grip = nil, float *trigger = nil);

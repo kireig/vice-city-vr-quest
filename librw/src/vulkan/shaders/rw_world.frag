@@ -24,7 +24,15 @@ void main()
 	vec4 colour = fragColour * texture(diffuseTexture, fragTexCoord);
 
 	if(RW_ALPHA_TEST == 1){
-		if(colour.a < push.surfaceProps.w)
+		// The PS2 rule splits a blended mesh in two: the solid half is
+		// drawn with depth writes, the faint half without. A negative
+		// reference selects that second half, so both come out of one
+		// shader without a pipeline variant of their own.
+		const float reference = push.surfaceProps.w;
+		if(reference >= 0.0){
+			if(colour.a < reference)
+				discard;
+		}else if(colour.a >= -reference)
 			discard;
 	}
 

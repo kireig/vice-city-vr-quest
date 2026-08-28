@@ -391,6 +391,24 @@ void setPostFx(uint32 mode, uint32 red, uint32 green, uint32 blue,
                float32 intensity);
 void setFxaaEnabled(bool32 enabled);
 void setSpatialAaMode(uint32 mode);
+// Build a mip chain for textures whose TXD shipped a single level.
+// Read when a raster is created, so it applies to what streams in next.
+void setGenerateMipmaps(bool32 enabled);
+// The PS2 two-pass alpha rule. On by default: without it masked
+// geometry writes depth for colour it never draws.
+void setPs2AlphaTestEnabled(bool32 enabled);
+bool32 getPs2AlphaTestEnabled(void);
+// One line saying how many textures got a chain and what turned the rest
+// away. Silent unless diagnostics are switched on: a player's logcat is
+// not the place for it.
+void reportGeneratedMips(void);
+void setRenderDiagnostics(bool32 enabled);
+bool32 renderDiagnosticsEnabled(void);
+// Uploads whatever the mip worker has finished. Call once per frame
+// from the thread that owns the command buffer.
+void uploadFinishedMips(void);
+// Joins the mip worker and drops anything still queued.
+void stopGeneratedMips(void);
 
 enum SgsrMode {
 	SGSR_OFF = 0,
