@@ -69,6 +69,7 @@ getTextureMemoryUsed(void)
 
 // Why a texture was passed over. Reported periodically, so a build that
 // quietly generates nothing can say which test it failed.
+static uint32 gMipPromoted;
 static uint32 gMipSeen, gMipMade, gMipOffFlag, gMipNotTexture,
 	gMipTooSmall, gMipBadFormat;
 // Total time spent filtering and re-encoding, so the cost of this is a
@@ -76,6 +77,8 @@ static uint32 gMipSeen, gMipMade, gMipOffFlag, gMipNotTexture,
 static uint64 gMipMicroseconds;
 static uint8 *gMipScratch[2];
 static size_t gMipScratchBytes;
+static uint8 *gMipMask;
+static size_t gMipMaskBytes;
 // Nothing waits on the chain any more, so the only reason to refuse a
 // texture is the scratch it would need: the worker holds two buffers of
 // the base size, and 2048 square is 16 MB apiece.
@@ -95,9 +98,9 @@ reportGeneratedMips(void)
 {
 	if(!renderDiagnosticsEnabled())
 		return;
-	VKLOG("mips: seen %u made %u in %llu ms | rejected flag %u type %u "
-	      "size %u large %u format %u | landed %u",
-	      gMipSeen, gMipMade,
+	VKLOG("mips: seen %u made %u promoted %u in %llu ms | rejected "
+	      "flag %u type %u size %u large %u format %u | landed %u",
+	      gMipSeen, gMipMade, gMipPromoted,
 	      (unsigned long long)(gMipMicroseconds/1000ull),
 	      gMipOffFlag, gMipNotTexture, gMipTooSmall, gMipTooLarge,
 	      gMipBadFormat, gMipLanded);
@@ -643,7 +646,8 @@ decodeBcBlock(const uint8 *block, VkFormat format, uint8 *rgba)
 }
 
 static void
-encodeColourBlock(const uint8 *rgba, bool32 punchThrough, uint8 *block)
+encodeColourBlock(const uint8 *rgba, bool32 skipClear,
+                  bool32 allowPunchThrough, uint8 *block)
 {
 	// Bounding box of the texels that are actually there. A mip level does not
 	// need a principal-axis fit; the endpoints only have to bracket what the
@@ -651,7 +655,7 @@ encodeColourBlock(const uint8 *rgba, bool32 punchThrough, uint8 *block)
 	uint32 lo[3] = { 255, 255, 255 }, hi[3] = { 0, 0, 0 };
 	bool32 anyOpaque = 0, anyClear = 0;
 	for(int t = 0; t < 16; t++){
-		if(punchThrough && rgba[t*4+3] < 128){
+		if(skipClear && rgba[t*4+3] < 128){
 			anyClear = 1;
 			continue;
 		}
@@ -671,7 +675,7 @@ encodeColourBlock(const uint8 *rgba, bool32 punchThrough, uint8 *block)
 	uint32 c1 = (((lo[0]*31+127)/255) << 11) | (((lo[1]*63+127)/255) << 5) |
 	            ((lo[2]*31+127)/255);
 	// BC1 reads the mode off the endpoint order, so it has to be forced.
-	const bool32 threeColour = punchThrough && anyClear;
+	const bool32 threeColour = allowPunchThrough && anyClear;
 	if(threeColour){
 		if(c0 > c1){ const uint32 s = c0; c0 = c1; c1 = s; }
 		if(c0 == c1){
@@ -747,10 +751,10 @@ static void
 encodeBcBlock(const uint8 *rgba, VkFormat format, uint8 *block)
 {
 	if(format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK){
-		encodeColourBlock(rgba, 1, block);
+		encodeColourBlock(rgba, 1, 1, block);
 		return;
 	}
-	encodeColourBlock(rgba, 0, block+8);
+	encodeColourBlock(rgba, 1, 0, block+8);
 	if(format == VK_FORMAT_BC2_UNORM_BLOCK){
 		for(int i = 0; i < 8; i++)
 			block[i] = (uint8)((((rgba[(i*2+1)*4+3]+8)/17) << 4) |
@@ -873,17 +877,84 @@ dxt1BlocksHaveTransparency(const uint8 *blocks, uint32 size)
 	return 0;
 }
 
-// Creates a texture directly from DXT blocks, no CPU decode. Adreno 740
-// reports full BC support, so stream data reaches the GPU the same way the
-// desktop D3D12 build uploads it. Decoding on the CPU instead cost
-// milliseconds per streamed texture, which surfaced as frame drops -- the
+// One bit of alpha cannot hold a filtered edge. Every level generated from a
+// punch-through BC1 texture is cut back to a mask, so a bush keeps its hard
+// edge at every distance and crawls as the head moves -- which is exactly
+// what the palm crowns, stored as BC2 with a real alpha ramp, never do.
+//
+// So give those textures somewhere to put the alpha: re-pack the base level
+// as BC3 before it is uploaded, and let the chain be built in that format.
+// A block with no cut-out is copied bit for bit and simply told it is opaque,
+// so the artist's own colour survives; only the blocks along the mask are
+// unpacked and fitted again, and those are the ones a mip is going to
+// rewrite anyway.
+static void
+promoteBc1ToBc3(const uint8 *blocks, uint32 width, uint32 height, uint8 *out)
+{
+	const uint32 across = (width+3)/4, down = (height+3)/4;
+	for(uint32 b = 0; b < across*down; b++){
+		const uint8 *source = blocks + (size_t)b*8;
+		uint8 *block = out + (size_t)b*16;
+		const uint32 colour0 = (uint32)source[0] | ((uint32)source[1] << 8);
+		const uint32 colour1 = (uint32)source[2] | ((uint32)source[3] << 8);
+		if(colour0 > colour1){
+			// Four-colour block: nothing in it is transparent.
+			block[0] = 255;
+			block[1] = 255;
+			memset(block+2, 0, 6);
+			memcpy(block+8, source, 8);
+			continue;
+		}
+		uint8 rgba[16*4];
+		decodeBcBlock(source, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, rgba);
+		encodeBcBlock(rgba, VK_FORMAT_BC3_UNORM_BLOCK, block);
+	}
+}
+
+// The fraction of a level a hard alpha cut keeps.
+static float32
+alphaCoverage(const uint8 *rgba, size_t texels, uint32 cut)
+{
+	size_t kept = 0;
+	for(size_t t = 0; t < texels; t++)
+		if(rgba[t*4+3] >= cut)
+			kept++;
+	return texels != 0 ? (float32)kept/(float32)texels : 0.0f;
+}
+
+// BC1 carries one bit of alpha, so a filtered level has to be cut back to a
+// mask before it can be encoded -- and cutting at half loses coverage every
+// time. Foliage is the worst case: each level keeps a little less of the
+// leaf than the one above it, and a tree three streets away ends up a
+// handful of leaves on a branch, thinning and thickening as the head moves.
+//
+// So pick the cut that keeps as much of this level as the artist's own mask
+// kept of the base. The edge stays hard -- one bit cannot do better -- but
+// the crown holds its weight all the way out.
+static void
+preserveAlphaCoverage(uint8 *rgba, size_t texels, float32 coverage)
+{
+	uint32 histogram[256];
+	memset(histogram, 0, sizeof(histogram));
+	for(size_t t = 0; t < texels; t++)
+		histogram[rgba[t*4+3]]++;
+	const size_t wanted = (size_t)(coverage*(float32)texels + 0.5f);
+	size_t kept = 0;
+	uint32 cut = 256;
+	while(cut > 1 && kept < wanted)
+		kept += histogram[--cut];
+	for(size_t t = 0; t < texels; t++)
+		rgba[t*4+3] = rgba[t*4+3] >= cut ? 255 : 0;
+}
+
 // Builds the chain from a copy of the base blocks into its own buffer, off
 // the game's threads. Each level is decoded from the one above it, filtered
 // with the same alpha weighting the uncompressed path uses, and encoded
 // again. False means nothing was written and the levels stay unused.
 static bool32
 buildCompressedMips(const uint8 *base, uint8 *out, uint32 baseWidth,
-                    uint32 baseHeight, VkFormat format, int32 numLevels)
+                    uint32 baseHeight, VkFormat sourceFormat,
+                    VkFormat outFormat, int32 numLevels)
 {
 	// Two scratch levels, ping-ponged: the one being read and the one being
 	// written. Kept between textures and grown to the largest seen -- the
@@ -902,7 +973,33 @@ buildCompressedMips(const uint8 *base, uint8 *out, uint32 baseWidth,
 	if(previous == nil || current == nil)
 		return 0;
 
-	decodeBcLevel(base, baseWidth, baseHeight, format, previous);
+	// One bit of alpha needs the coverage pass below, and that has to
+	// work on a copy: the next level is filtered from the smooth one,
+	// or the mask would be cut from an already cut level and the error
+	// would compound down the chain. Only level 1 is ever this large.
+	const bool32 punchThrough =
+		outFormat == VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+	const size_t maskBytes = punchThrough ?
+		(size_t)levelDimension(baseWidth, 1)*
+		levelDimension(baseHeight, 1)*4 : 0;
+	if(maskBytes > gMipMaskBytes){
+		rwFree(gMipMask);
+		gMipMask = (uint8*)rwMalloc(maskBytes, MEMDUR_GLOBAL | ID_IMAGE);
+		gMipMaskBytes = gMipMask != nil ? maskBytes : 0;
+	}
+
+	// The artist's own blocks, whatever they were packed as: a promoted
+	// texture is filtered from the original rather than from the copy
+	// that was just re-packed for the upload.
+	decodeBcLevel(base, baseWidth, baseHeight, sourceFormat, previous);
+	// A texture with no cut-outs, or nothing but cut-outs, has no
+	// coverage to hold on to.
+	float32 baseCoverage = 0.0f;
+	if(punchThrough && gMipMask != nil)
+		baseCoverage = alphaCoverage(previous,
+			(size_t)baseWidth*baseHeight, 128);
+	const bool32 holdCoverage =
+		baseCoverage > 0.0f && baseCoverage < 1.0f;
 	uint32 sourceWidth = baseWidth, sourceHeight = baseHeight;
 	VkDeviceSize offset = 0;
 	for(int32 level = 1; level < numLevels; level++){
@@ -910,8 +1007,16 @@ buildCompressedMips(const uint8 *base, uint8 *out, uint32 baseWidth,
 		const uint32 height = levelDimension(baseHeight, level);
 		downsampleLevel(previous, sourceWidth, sourceHeight,
 			current, width, height, VK_FORMAT_R8G8B8A8_UNORM, 4);
-		encodeBcLevel(current, width, height, format, out+offset);
-		offset += alignLevel(bcLevelBytes(width, height, format));
+		const uint8 *encodeFrom = current;
+		if(holdCoverage){
+			const size_t levelTexels = (size_t)width*height;
+			memcpy(gMipMask, current, levelTexels*4);
+			preserveAlphaCoverage(gMipMask, levelTexels,
+				baseCoverage);
+			encodeFrom = gMipMask;
+		}
+		encodeBcLevel(encodeFrom, width, height, outFormat, out+offset);
+		offset += alignLevel(bcLevelBytes(width, height, outFormat));
 		uint8 *swap = previous; previous = current; current = swap;
 		sourceWidth = width;
 		sourceHeight = height;
@@ -936,6 +1041,9 @@ buildCompressedMips(const uint8 *base, uint8 *out, uint32 baseWidth,
 struct GeneratedMipJob
 {
 	VulkanRaster *native;
+	// What the base blocks are packed as, and what the chain is
+	// written as. They differ for a promoted texture.
+	VkFormat sourceFormat;
 	VkFormat format;
 	uint32 width;
 	uint32 height;
@@ -950,6 +1058,11 @@ static std::mutex gMipMutex;
 static std::condition_variable gMipSignal;
 static std::deque<GeneratedMipJob*> gMipPending;
 static std::deque<GeneratedMipJob*> gMipFinished;
+// The job being filtered right now. It sits in neither queue while that
+// runs, so a raster destroyed in that window walks straight past the
+// scan in cancelGeneratedMips and the finished job comes back holding a
+// handle that no longer exists.
+static GeneratedMipJob *gMipInFlight;
 static std::thread gMipWorker;
 static bool gMipWorkerStarted;
 static bool gMipWorkerStop;
@@ -981,13 +1094,21 @@ mipWorkerBody(void)
 				freeMipJob(job);
 				continue;
 			}
+			gMipInFlight = job;
 		}
 		const uint64 startedAt = microseconds();
 		buildCompressedMips(job->source, job->result, job->width,
-			job->height, job->format, job->numLevels);
+			job->height, job->sourceFormat, job->format,
+			job->numLevels);
 		gMipMicroseconds += microseconds()-startedAt;
 		{
 			std::lock_guard<std::mutex> lock(gMipMutex);
+			gMipInFlight = nil;
+			// The raster may have been evicted while this ran.
+			if(job->cancelled || job->native == nil){
+				freeMipJob(job);
+				continue;
+			}
 			gMipFinished.push_back(job);
 		}
 	}
@@ -1004,6 +1125,10 @@ cancelGeneratedMips(VulkanRaster *native)
 			gMipPending[i]->cancelled = true;
 			gMipPending[i]->native = nil;
 		}
+	if(gMipInFlight != nil && gMipInFlight->native == native){
+		gMipInFlight->cancelled = true;
+		gMipInFlight->native = nil;
+	}
 	for(size_t i = 0; i < gMipFinished.size(); i++)
 		if(gMipFinished[i]->native == native){
 			gMipFinished[i]->cancelled = true;
@@ -1012,8 +1137,9 @@ cancelGeneratedMips(VulkanRaster *native)
 }
 
 static void
-queueGeneratedMips(VulkanRaster *native, VkFormat format, uint32 width,
-                   uint32 height, int32 numLevels, const uint8 *blocks,
+queueGeneratedMips(VulkanRaster *native, VkFormat sourceFormat,
+                   VkFormat format, uint32 width, uint32 height,
+                   int32 numLevels, const uint8 *blocks,
                    VkDeviceSize sourceBytes)
 {
 	VkDeviceSize resultBytes = 0;
@@ -1030,6 +1156,7 @@ queueGeneratedMips(VulkanRaster *native, VkFormat format, uint32 width,
 		return;
 	memset(job, 0, sizeof(*job));
 	job->native = native;
+	job->sourceFormat = sourceFormat;
 	job->format = format;
 	job->width = width;
 	job->height = height;
@@ -1055,11 +1182,12 @@ queueGeneratedMips(VulkanRaster *native, VkFormat format, uint32 width,
 }
 
 // The finished levels, uploaded from the thread that owns the command
-// buffer. That is the same thread the game streams and evicts textures on,
-// which is what makes it safe to touch a job's raster after the queue lock
-// is released: nothing can destroy it in between. Bounded per call, so a
-// burst of streamed textures does not turn into one long frame at this end
-// either.
+// buffer. A job's raster is read after the queue lock is released, which
+// is only safe because rasters are created and destroyed on this same
+// thread -- the game's. The worker never destroys one; it hands the job
+// back and lets cancelGeneratedMips disown it. Bounded per call, so a
+// burst of streamed textures does not turn into one long frame at this
+// end either.
 void
 uploadFinishedMips(void)
 {
@@ -1166,8 +1294,11 @@ stopGeneratedMips(void)
 	gMipWorkerStop = false;
 	rwFree(gMipScratch[0]);
 	rwFree(gMipScratch[1]);
+	rwFree(gMipMask);
 	gMipScratch[0] = gMipScratch[1] = nil;
+	gMipMask = nil;
 	gMipScratchBytes = 0;
+	gMipMaskBytes = 0;
 	std::lock_guard<std::mutex> lock(gMipMutex);
 	while(!gMipPending.empty()){
 		freeMipJob(gMipPending.front());
@@ -1179,6 +1310,10 @@ stopGeneratedMips(void)
 	}
 }
 
+// Creates a texture directly from DXT blocks, no CPU decode. Adreno 740
+// reports full BC support, so stream data reaches the GPU the same way the
+// desktop D3D12 build uploads it. Decoding on the CPU instead cost
+// milliseconds per streamed texture, which surfaced as frame drops -- the
 // world lurching -- whenever driving streamed new map sectors in.
 Raster *
 rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
@@ -1220,6 +1355,22 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	const bool32 blockAlpha =
 		dxt == 1 && dxt1BlocksHaveTransparency(blocks, size);
 	native->hasAlpha = hasAlpha || blockAlpha;
+
+	// A cut-out BC1 texture is re-packed as BC3 on the way up, so the
+	// generated levels have somewhere to keep the alpha the filter
+	// produces. Only worth the second four bits per block when there
+	// is a chain to fill: without one the base is the artist's mask
+	// either way. The blocks the worker filters stay the originals.
+	const VkFormat sourceFormat = format;
+	const uint32 sourceSize = size;
+	const bool32 promote = native->generateMips && blockAlpha &&
+		format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+	if(promote){
+		format = VK_FORMAT_BC3_UNORM_BLOCK;
+		native->format = format;
+		size = bcLevelBytes((uint32)width, (uint32)height, format);
+		gMipPromoted++;
+	}
 	if(blockAlpha && !hasAlpha){
 		static uint32 detectedWithoutHeader = 0;
 		if(detectedWithoutHeader < 8){
@@ -1296,7 +1447,10 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	uint8 *mapped = nil;
 	vkMapMemory(gvk.device, stagingMemory, 0, stagingSize, 0,
 	            (void**)&mapped);
-	memcpy(mapped, blocks, size);
+	if(promote)
+		promoteBc1ToBc3(blocks, (uint32)width, (uint32)height, mapped);
+	else
+		memcpy(mapped, blocks, size);
 	vkUnmapMemory(gvk.device, stagingMemory);
 
 	VkCommandBuffer commandBuffer = beginOneShot();
@@ -1327,8 +1481,9 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	retireBuffer(staging, stagingMemory);
 
 	if(native->numLevels > 1)
-		queueGeneratedMips(native, format, (uint32)width, (uint32)height,
-			native->numLevels, blocks, size);
+		queueGeneratedMips(native, sourceFormat, format,
+			(uint32)width, (uint32)height, native->numLevels,
+			blocks, sourceSize);
 
 	return raster;
 }
