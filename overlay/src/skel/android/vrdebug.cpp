@@ -28,6 +28,7 @@
 #include "Frontend.h"
 #include "Renderer.h"
 #include "Shadows.h"
+#include "PointLights.h"
 #include "ParticleObject.h"
 #include "CutsceneMgr.h"
 #include "Camera.h"
@@ -153,13 +154,58 @@ static int gGenerateMipmaps = 1;
 // The PS2 two-pass alpha rule the desktop backends have always run: the
 // solid half of a blended mesh writes depth, the faint half only blends.
 // Without it the invisible border around a railing cuts its own outline
-// out of the wall behind it. It costs a second draw for that geometry,
-// so there is a way to turn it off and compare.
-static int gPs2AlphaTest = 1;
+// out of the wall behind it.
+// Off by default all the same: every masked mesh goes twice, and a
+// street of railings, fences and foliage is most of what a Vice City
+// block is made of. The fringe it removes is faint and daylight-only;
+// the draws are paid everywhere. On for anyone who would rather have
+// it the other way round.
+static int gPs2AlphaTest = 0;
+// The game's point lights -- headlights, explosions, street lamps --
+// evaluated per pixel against the world instead of being folded into the
+// per-entity directionals the fixed function used. 0 off, 1 on, 2 adds the
+// air glow that makes a source visible in the air and not only as its pool.
+// Off until the player turns it on: it is new, it costs GPU on a block
+// with a lamp every few metres, and off it costs nothing at all -- the
+// shaders skip the block when the frame carries no lights.
+static int gDynamicLights = 0;
+// Percent scales for the light sum and the glow: neon-dense blocks like
+// Ocean Drive stack several lamps over one stretch of pavement and the sum
+// can read as overexposure, so the player picks the level, not the code.
+static int gDynamicLightIntensity = 100;
+static int gDynamicLightGlowIntensity = 100;
+// How many of the nearest lights the backend is handed. Fewer is the perf
+// lever for lamp-dense streets; visually four is already hard to tell from
+// eight, which is why four is the default.
+static int gDynamicLightMax = 4;
+// Reflections on vehicle env-map materials: the previous frame
+// reprojected onto the bodywork, over the DFF's own streak art as a
+// panorama where that lookup has no answer. The original drew these
+// as a second textured pass the Vulkan backend never picked up.
+static int gCarReflections = 0;
+// Player-tuned reflection strengths. Intensity scales the whole layer --
+// at 100 some paints read glassy, lowering it is the cure. The SSR percent
+// scales only the live previous-frame part, 0 leaves every car on the
+// panorama; and the SSR distance draws the live part only within that many
+// metres of the eye, 0 meaning no limit.
+static int gCarReflectionIntensity = 100;
+static int gCarReflectionSsr = 100;
+static int gCarReflectionSsrDistance = 0;
+// How far the finished frame is reduced before the reflection samples
+// it, with 1 reading the frame itself. It changes how soft the mirrored
+// street looks and how much memory the copy takes; it does not change
+// the frame time, which is what it was added to test. Read by the
+// backend at startup, hence the restart.
+static int gCarReflectionScale = 4;
 // Renderer counters in logcat. A shipped build has no business
 // writing to a player log every ten seconds, so this stays off
 // unless it is asked for.
 static int gRenderDiagnostics;
+// How far down the mip chain masked geometry is sampled, in half
+// levels. A leaf mask is finer than a pixel at any distance worth
+// looking at, so it sparkles; nothing spatial can resolve it, and
+// softening it is what a temporal filter buys on desktop.
+static int gFoliageSoftness;
 // A cutscene runs its own director camera. CINEMA puts that camera on
 // the flat theater screen, which is where it has always gone; the other
 // modes let the headset render it in stereo instead, so the scene has
@@ -175,7 +221,7 @@ static char gCutsceneCameraScene[32];
 static bool gCutsceneCycleDown;
 static bool gCutsceneStoreDown;
 static bool gQuestQuickTestStart;
-static int gQuestRenderScalePercent = 125;
+static int gQuestRenderScalePercent = 100;
 static int gQuestSgsrMode = rw::vulkan::SGSR_OFF;
 static int gQuestMsaaSamples = 1;
 static int gOcclusionCullingMode = VR_OCCLUSION_CULLING_AUTHORED;
@@ -366,6 +412,7 @@ static int gVrPadBinding[androidgame::VR_PAD_SOURCE_COUNT];
 static int gVrMenuPage;
 static int gVrMenuSelection;
 static int gVrGraphicsSelection;
+static int gVrLightingSelection;
 static int gVrWeaponsSelection;
 static int gVrHudSelection;
 static int gVrWristRadarSelection;
@@ -402,6 +449,7 @@ static int gQuestGpuPerformanceMode = 1; // SUSTAINED; enum is declared below.
 enum {
 	VR_MENU_PAGE_SETTINGS,
 	VR_MENU_PAGE_GRAPHICS,
+	VR_MENU_PAGE_LIGHTING,
 	VR_MENU_PAGE_WEAPONS,
 	VR_MENU_PAGE_HUD,
 	VR_MENU_PAGE_WRIST_RADAR,
@@ -416,6 +464,20 @@ enum {
 	VR_MENU_PAGE_CHEATS,
 	VR_MENU_PAGE_MISSIONS,
 	VR_MENU_PAGE_ABOUT,
+};
+
+enum eVrLightingMenuItem {
+	VR_LIGHTING_MODE = 0,
+	VR_LIGHTING_INTENSITY,
+	VR_LIGHTING_GLOW_INTENSITY,
+	VR_LIGHTING_MAX_LIGHTS,
+	VR_LIGHTING_CAR_REFLECTIONS,
+	VR_LIGHTING_REFLECTION_INTENSITY,
+	VR_LIGHTING_REFLECTION_SSR,
+	VR_LIGHTING_SSR_DISTANCE,
+	VR_LIGHTING_SSR_SCALE,
+	VR_LIGHTING_BACK,
+	VR_LIGHTING_ITEM_COUNT
 };
 
 enum eVrTrafficMenuItem {
@@ -504,12 +566,14 @@ enum eVrGraphicsMenuItem {
 	VR_GRAPHICS_FXAA,
 	VR_GRAPHICS_MIPMAPS,
 	VR_GRAPHICS_PS2_ALPHA,
+	VR_GRAPHICS_FOLIAGE,
 	VR_GRAPHICS_DIAGNOSTICS,
 	VR_GRAPHICS_COLOR,
 	VR_GRAPHICS_PROFILER,
 	VR_GRAPHICS_CPU_PERFORMANCE,
 	VR_GRAPHICS_GPU_PERFORMANCE,
 	VR_GRAPHICS_SHADOWS,
+	VR_GRAPHICS_DYNAMIC_LIGHTS,
 	VR_GRAPHICS_OCCLUSION,
 	VR_GRAPHICS_FOUNTAIN,
 	VR_GRAPHICS_FOG,
@@ -791,10 +855,35 @@ LoadVrSettings(void)
 			".\\vr_settings.ini") != 0;
 	gGenerateMipmaps = GetPrivateProfileIntA("VR", "GenerateMipmaps", 1,
 		".\\vr_settings.ini") != 0 ? 1 : 0;
-	gPs2AlphaTest = GetPrivateProfileIntA("VR", "Ps2AlphaTest", 1,
+	gPs2AlphaTest = GetPrivateProfileIntA("VR", "Ps2AlphaTest", 0,
 		".\\vr_settings.ini") != 0 ? 1 : 0;
+	gDynamicLights = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"DynamicLights", 0, ".\\vr_settings.ini"), 0, 2);
+	gDynamicLightIntensity = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"DynamicLightIntensity", 100, ".\\vr_settings.ini"), 25, 200);
+	gDynamicLightGlowIntensity = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"DynamicLightGlowIntensity", 100, ".\\vr_settings.ini"), 25, 200);
+	gDynamicLightMax = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"DynamicLightMax", 4, ".\\vr_settings.ini"), 2, 8) & ~1;
+	gCarReflections = GetPrivateProfileIntA("VR", "CarReflections", 0,
+		".\\vr_settings.ini") != 0 ? 1 : 0;
+	gCarReflectionIntensity = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"CarReflectionIntensity", 100, ".\\vr_settings.ini"), 10, 200);
+	gCarReflectionSsr = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"CarReflectionSsr", 100, ".\\vr_settings.ini"), 0, 150);
+	gCarReflectionScale = GetPrivateProfileIntA("VR",
+		"CarReflectionScale", 4, ".\\vr_settings.ini");
+	if(gCarReflectionScale != 1 && gCarReflectionScale != 2 &&
+	   gCarReflectionScale != 4 && gCarReflectionScale != 8)
+		gCarReflectionScale = 4;
+	gCarReflectionSsrDistance = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"CarReflectionSsrDistance", 0, ".\\vr_settings.ini"), 0, 150);
+	if(gCarReflectionSsrDistance != 0 && gCarReflectionSsrDistance < 5)
+		gCarReflectionSsrDistance = 5;
 	gRenderDiagnostics = GetPrivateProfileIntA("VR",
 		"RenderDiagnostics", 0, ".\\vr_settings.ini") != 0 ? 1 : 0;
+	gFoliageSoftness = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"FoliageSoftness", 0, ".\\vr_settings.ini"), 0, 3);
 	gCutsceneMode = clamp((int)(int32)GetPrivateProfileIntA("VR",
 		"CutsceneMode", 0, ".\\vr_settings.ini"), 0, 1);
 	// Remembered across launches so a build handed over for testing can
@@ -809,7 +898,7 @@ LoadVrSettings(void)
 	{
 		static const int scales[] = { 100, 125, 150, 175 };
 		const int savedScale = GetPrivateProfileIntA("VR", "RenderScalePercent",
-			125, ".\\vr_settings.ini");
+			100, ".\\vr_settings.ini");
 		int best = 0;
 		for(int i = 1; i < (int)ARRAY_SIZE(scales); i++)
 			if(Abs(scales[i]-savedScale) < Abs(scales[best]-savedScale))
@@ -821,8 +910,12 @@ LoadVrSettings(void)
 	// silently reactivate an eye-straining mode.
 	gQuestSgsrMode = rw::vulkan::SGSR_OFF;
 	SaveVrInteger("Sgsr2Mode", gQuestSgsrMode);
-	gQuestMsaaSamples = 1;
-	SaveVrInteger("MsaaSamples", gQuestMsaaSamples);
+	gQuestMsaaSamples = GetPrivateProfileIntA("VR", "MsaaSamples", 1,
+		".\\vr_settings.ini");
+	// Off, 2x or 4x and nothing else: the swapchain is built from
+	// this and an ini carrying anything else has to land somewhere.
+	gQuestMsaaSamples = gQuestMsaaSamples >= 4 ? 4 :
+		gQuestMsaaSamples >= 2 ? 2 : 1;
 	CParticleObject::SetVrFountainQuality(Min(Max(GetPrivateProfileIntA("VR",
 		"FountainQuality", VR_FOUNTAIN_OPTIMIZED, ".\\vr_settings.ini"),
 		(int)VR_FOUNTAIN_OFF), (int)VR_FOUNTAIN_QUALITY_COUNT-1));
@@ -1034,12 +1127,15 @@ LoadVrSettings(void)
 		(int)(CIniFile::PedNumberMultiplier*100.0f+0.5f), 50), 300);
 	const int defaultCarPercent = Min(Max(
 		(int)(CIniFile::CarNumberMultiplier*100.0f+0.5f), 50), 300);
+	// Down to nothing at all. Half density was the old floor, which
+	// left no way to actually empty a street -- for looking at one
+	// car, or for measuring anything against a stable frame.
 	gTrafficPedPercent = Min(Max(GetPrivateProfileIntA("VR",
 		"PedTrafficPercent", defaultPedPercent,
-		".\\vr_settings.ini"), 50), 300);
+		".\\vr_settings.ini"), 0), 300);
 	gTrafficCarPercent = Min(Max(GetPrivateProfileIntA("VR",
 		"CarTrafficPercent", defaultCarPercent,
-		".\\vr_settings.ini"), 50), 300);
+		".\\vr_settings.ini"), 0), 300);
 	QuestPhysicsDirectorSetMode(Min(Max(GetPrivateProfileIntA("VR",
 		"PhysicsDirectorMode", QUEST_PHYSICS_DIRECTOR_ADAPTIVE,
 		".\\vr_settings.ini"),
@@ -1465,6 +1561,7 @@ CurrentMenuSelection(void)
 {
 	switch(gVrMenuPage){
 	case VR_MENU_PAGE_GRAPHICS: return &gVrGraphicsSelection;
+	case VR_MENU_PAGE_LIGHTING: return &gVrLightingSelection;
 	case VR_MENU_PAGE_WEAPONS: return &gVrWeaponsSelection;
 	case VR_MENU_PAGE_HUD: return &gVrHudSelection;
 	case VR_MENU_PAGE_WRIST_RADAR: return &gVrWristRadarSelection;
@@ -1491,6 +1588,7 @@ CurrentMenuItemCount(void)
 	switch(gVrMenuPage){
 	case VR_MENU_PAGE_SETTINGS: return VR_MAIN_ITEM_COUNT;
 	case VR_MENU_PAGE_GRAPHICS: return VR_GRAPHICS_ITEM_COUNT;
+	case VR_MENU_PAGE_LIGHTING: return VR_LIGHTING_ITEM_COUNT;
 	case VR_MENU_PAGE_WEAPONS: return VR_WEAPONS_ITEM_COUNT;
 	case VR_MENU_PAGE_HUD: return VR_HUD_ITEM_COUNT;
 	case VR_MENU_PAGE_WRIST_RADAR: return VR_WRIST_ITEM_COUNT;
@@ -1621,6 +1719,12 @@ CurrentMenuValueRepeats(void)
 	if(gVrMenuPage == VR_MENU_PAGE_TRAFFIC)
 		return gVrTrafficSelection == VR_TRAFFIC_PEDESTRIANS ||
 			gVrTrafficSelection == VR_TRAFFIC_VEHICLES;
+	if(gVrMenuPage == VR_MENU_PAGE_LIGHTING)
+		return gVrLightingSelection == VR_LIGHTING_INTENSITY ||
+			gVrLightingSelection == VR_LIGHTING_GLOW_INTENSITY ||
+			gVrLightingSelection == VR_LIGHTING_REFLECTION_INTENSITY ||
+			gVrLightingSelection == VR_LIGHTING_REFLECTION_SSR ||
+			gVrLightingSelection == VR_LIGHTING_SSR_DISTANCE;
 	if(gVrMenuPage == VR_MENU_PAGE_VEHICLE)
 		return gVrVehicleSelection >= VR_VEHICLE_DEFAULT_SEAT_HEIGHT &&
 			gVrVehicleSelection <= VR_VEHICLE_MODEL_SEAT_FORWARD;
@@ -1657,6 +1761,10 @@ ReturnFromCurrentMenuPage(void)
 	}
 	if(gVrMenuPage == VR_MENU_PAGE_WRIST_RADAR){
 		gVrMenuPage = VR_MENU_PAGE_HUD;
+		return;
+	}
+	if(gVrMenuPage == VR_MENU_PAGE_LIGHTING){
+		gVrMenuPage = VR_MENU_PAGE_GRAPHICS;
 		return;
 	}
 	gVrMenuPage = VR_MENU_PAGE_SETTINGS;
@@ -1959,8 +2067,17 @@ VrDebugUpdate(const PadInput &in)
 			}else if(gVrGraphicsSelection == VR_GRAPHICS_SGSR){
 				// Reserved for a future stereo-stable temporal AA path.
 			}else if(gVrGraphicsSelection == VR_GRAPHICS_MSAA){
-				gQuestMsaaSamples = 1;
+				// Off, 2x, 4x. It smooths the geometry it was made
+				// for -- railings, poles, wires. Masks are left to the
+				// mip chain; turning them into coverage instead put a
+				// dither lattice across every leaf and neon tube.
+				gQuestMsaaSamples = gQuestMsaaSamples >= 4 ? 1 :
+					gQuestMsaaSamples >= 2 ? 4 : 2;
 				SaveVrInteger("MsaaSamples", gQuestMsaaSamples);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_FOLIAGE){
+				gFoliageSoftness = (gFoliageSoftness+4+
+					(decreasePulse ? -1 : 1))%4;
+				SaveVrInteger("FoliageSoftness", gFoliageSoftness);
 			}else if(gVrGraphicsSelection == VR_GRAPHICS_DIAGNOSTICS){
 				gRenderDiagnostics = !gRenderDiagnostics;
 				SaveVrInteger("RenderDiagnostics", gRenderDiagnostics);
@@ -2014,6 +2131,9 @@ VrDebugUpdate(const PadInput &in)
 				CShadows::SetRenderEnabled(!CShadows::IsRenderEnabled());
 				SaveVrInteger("ShadowsEnabled",
 					CShadows::IsRenderEnabled() ? 1 : 0);
+			}else if(gVrGraphicsSelection == VR_GRAPHICS_DYNAMIC_LIGHTS){
+				gVrMenuPage = VR_MENU_PAGE_LIGHTING;
+				gVrLightingSelection = 0;
 			}else if(gVrGraphicsSelection == VR_GRAPHICS_OCCLUSION){
 				const int direction = decreasePulse ? -1 : 1;
 				gOcclusionCullingMode =
@@ -2079,20 +2199,76 @@ VrDebugUpdate(const PadInput &in)
 			}else if(gVrModelAssetsSelection == VR_MODEL_ASSETS_BACK &&
 			         positivePulse)
 				gVrMenuPage = VR_MENU_PAGE_SETTINGS;
+		}else if(gVrMenuPage == VR_MENU_PAGE_LIGHTING &&
+		         (positivePulse || decreasePulse)){
+			const int direction = decreasePulse ? -1 : 1;
+			const int step = direction*Max(1, repeatMagnitude);
+			if(gVrLightingSelection == VR_LIGHTING_MODE){
+				gDynamicLights = (gDynamicLights+3+direction)%3;
+				SaveVrInteger("DynamicLights", gDynamicLights);
+			}else if(gVrLightingSelection == VR_LIGHTING_INTENSITY){
+				gDynamicLightIntensity = clamp(
+					gDynamicLightIntensity+step*5, 25, 200);
+				SaveVrInteger("DynamicLightIntensity",
+					gDynamicLightIntensity);
+			}else if(gVrLightingSelection == VR_LIGHTING_GLOW_INTENSITY){
+				gDynamicLightGlowIntensity = clamp(
+					gDynamicLightGlowIntensity+step*5, 25, 200);
+				SaveVrInteger("DynamicLightGlowIntensity",
+					gDynamicLightGlowIntensity);
+			}else if(gVrLightingSelection == VR_LIGHTING_MAX_LIGHTS){
+				gDynamicLightMax = clamp(gDynamicLightMax+direction*2,
+					2, 8);
+				SaveVrInteger("DynamicLightMax", gDynamicLightMax);
+			}else if(gVrLightingSelection == VR_LIGHTING_CAR_REFLECTIONS){
+				gCarReflections = !gCarReflections;
+				SaveVrInteger("CarReflections", gCarReflections);
+			}else if(gVrLightingSelection ==
+			         VR_LIGHTING_REFLECTION_INTENSITY){
+				gCarReflectionIntensity = clamp(
+					gCarReflectionIntensity+step*5, 10, 200);
+				SaveVrInteger("CarReflectionIntensity",
+					gCarReflectionIntensity);
+			}else if(gVrLightingSelection == VR_LIGHTING_REFLECTION_SSR){
+				gCarReflectionSsr = clamp(
+					gCarReflectionSsr+step*5, 0, 150);
+				SaveVrInteger("CarReflectionSsr", gCarReflectionSsr);
+			}else if(gVrLightingSelection == VR_LIGHTING_SSR_DISTANCE){
+				// 5..150 metres in fives, with 0 standing for no limit at
+				// the top of the range.
+				int linear = gCarReflectionSsrDistance == 0 ?
+					155 : gCarReflectionSsrDistance;
+				linear = clamp(linear+step*5, 5, 155);
+				gCarReflectionSsrDistance = linear >= 155 ? 0 : linear;
+				SaveVrInteger("CarReflectionSsrDistance",
+					gCarReflectionSsrDistance);
+			}else if(gVrLightingSelection == VR_LIGHTING_SSR_SCALE){
+				static const int scales[] = { 1, 2, 4, 8 };
+				int index = 0;
+				for(int i = 0; i < (int)ARRAY_SIZE(scales); i++)
+					if(scales[i] == gCarReflectionScale)
+						index = i;
+				index = (index+direction+(int)ARRAY_SIZE(scales))%
+					(int)ARRAY_SIZE(scales);
+				gCarReflectionScale = scales[index];
+				SaveVrInteger("CarReflectionScale", gCarReflectionScale);
+			}else if(gVrLightingSelection == VR_LIGHTING_BACK){
+				gVrMenuPage = VR_MENU_PAGE_GRAPHICS;
+			}
 		}else if(gVrMenuPage == VR_MENU_PAGE_TRAFFIC &&
 		         (positivePulse || decreasePulse)){
 			const int direction = decreasePulse ? -1 : 1;
 			switch(gVrTrafficSelection){
 			case VR_TRAFFIC_PEDESTRIANS:
 				gTrafficPedPercent = Min(Max(
-					gTrafficPedPercent+direction*5, 50), 300);
+					gTrafficPedPercent+direction*5, 0), 300);
 				SaveVrInteger("PedTrafficPercent",
 					gTrafficPedPercent);
 				ApplyTrafficSettings();
 				break;
 			case VR_TRAFFIC_VEHICLES:
 				gTrafficCarPercent = Min(Max(
-					gTrafficCarPercent+direction*5, 50), 300);
+					gTrafficCarPercent+direction*5, 0), 300);
 				SaveVrInteger("CarTrafficPercent",
 					gTrafficCarPercent);
 				ApplyTrafficSettings();
@@ -2697,7 +2873,8 @@ QuestMenuPageColour(uint8 *red, uint8 *green, uint8 *blue)
 {
 	int category = -1;
 	switch(gVrMenuPage){
-	case VR_MENU_PAGE_GRAPHICS: category = VR_MAIN_GRAPHICS; break;
+	case VR_MENU_PAGE_GRAPHICS:
+	case VR_MENU_PAGE_LIGHTING: category = VR_MAIN_GRAPHICS; break;
 	case VR_MENU_PAGE_TRAFFIC: category = VR_MAIN_TRAFFIC_SETTINGS; break;
 	case VR_MENU_PAGE_HUD:
 	case VR_MENU_PAGE_WRIST_RADAR: category = VR_MAIN_HUD; break;
@@ -2742,8 +2919,18 @@ BeginFullVrMenuPage(const char *heading, const char *subtitle = nil)
 static void
 DrawFullVrMenuRow(const char *text, int y, int scale, bool selected,
                   bool available = true, bool warning = false,
-                  bool positive = false)
+                  bool positive = false, bool highlight = false)
 {
+	// A row worth finding on a page where every line reads alike, in
+	// the title pink because nothing else on a page uses it.
+	if(highlight){
+		if(selected)
+			FillVrMenuRect(85, y-5, VR_MENU_WIDTH-85,
+				y+scale*7+4, 95, 32, 78, 245);
+		DrawVrMenuText(text, VR_MENU_WIDTH/2, y, scale,
+			255, selected ? 165 : 120, selected ? 228 : 205);
+		return;
+	}
 	if(selected)
 		FillVrMenuRect(85, y-5, VR_MENU_WIDTH-85,
 			y+scale*7+4,
@@ -2823,7 +3010,9 @@ DrawQuestGraphicsPage(void)
 	snprintf(rows[VR_GRAPHICS_SGSR], sizeof(rows[0]),
 		"TEMPORAL AA < DISABLED - UNSTABLE >");
 	snprintf(rows[VR_GRAPHICS_MSAA], sizeof(rows[0]),
-		"STEREO MSAA  < DISABLED - NO VISIBLE GAIN >");
+		"* STEREO MSAA  < %s - RESTART >",
+		gQuestMsaaSamples >= 4 ? "4X" :
+		gQuestMsaaSamples >= 2 ? "2X" : "OFF");
 	snprintf(rows[VR_GRAPHICS_FXAA], sizeof(rows[0]),
 		"SPATIAL AA  < %s >", gSpatialAaMode ? "ON" : "OFF");
 	snprintf(rows[VR_GRAPHICS_PS2_ALPHA], sizeof(rows[0]),
@@ -2832,6 +3021,11 @@ DrawQuestGraphicsPage(void)
 	snprintf(rows[VR_GRAPHICS_MIPMAPS], sizeof(rows[0]),
 		"* GENERATE MIPMAPS  < %s >",
 		gGenerateMipmaps ? "ON (RESTART)" : "OFF");
+	snprintf(rows[VR_GRAPHICS_FOLIAGE], sizeof(rows[0]),
+		"* FOLIAGE SOFTNESS  < %s >",
+		gFoliageSoftness == 3 ? "1.5 LEVELS" :
+		gFoliageSoftness == 2 ? "1.0 LEVEL" :
+		gFoliageSoftness == 1 ? "0.5 LEVEL" : "OFF");
 	snprintf(rows[VR_GRAPHICS_DIAGNOSTICS], sizeof(rows[0]),
 		"* RENDERER LOG  < %s >",
 		gRenderDiagnostics ? "ON" : "OFF");
@@ -2855,6 +3049,10 @@ DrawQuestGraphicsPage(void)
 	snprintf(rows[VR_GRAPHICS_SHADOWS], sizeof(rows[0]),
 		"WORLD SHADOWS  < %s >",
 		CShadows::IsRenderEnabled() ? "ON" : "OFF");
+	snprintf(rows[VR_GRAPHICS_DYNAMIC_LIGHTS], sizeof(rows[0]),
+		"EFFECTS  < OPEN >  LIGHTS %s",
+		gDynamicLights >= 2 ? "ON + AIR GLOW" :
+		gDynamicLights == 1 ? "ON" : "OFF");
 	snprintf(rows[VR_GRAPHICS_OCCLUSION], sizeof(rows[0]),
 		"OCCLUSION CULLING  < %s >",
 		CRenderer::GetVrOcclusionCullingModeName());
@@ -2871,12 +3069,17 @@ DrawQuestGraphicsPage(void)
 		// The developer rows are drawn in the positive green so they
 		// read as instruments rather than settings: a page of identical
 		// lines is where the profiler kept getting lost.
-		DrawFullVrMenuRow(rows[item], 142+item*31, 3,
+		DrawFullVrMenuRow(rows[item], 142+item*29, 3,
 			item == gVrGraphicsSelection, true, false,
 			item == VR_GRAPHICS_PROFILER ||
 				item == VR_GRAPHICS_MIPMAPS ||
 				item == VR_GRAPHICS_PS2_ALPHA ||
-				item == VR_GRAPHICS_DIAGNOSTICS);
+				item == VR_GRAPHICS_MSAA ||
+				item == VR_GRAPHICS_DIAGNOSTICS ||
+				item == VR_GRAPHICS_FOLIAGE,
+			// Dynamic lights and car reflections ship off, so the row
+			// that leads to them is the one a player has to notice.
+			item == VR_GRAPHICS_DYNAMIC_LIGHTS);
 	if(scaleStatusValid){
 		char activeScale[192];
 		snprintf(activeScale, sizeof(activeScale),
@@ -2892,11 +3095,11 @@ DrawQuestGraphicsPage(void)
 					scaleStatus.fallbackReason) : "");
 		const bool fallback = scaleStatus.fallbackReason !=
 			xrvk::RENDER_SCALE_FALLBACK_NONE;
-		DrawVrMenuText(activeScale, VR_MENU_WIDTH/2, 678, 2,
+		DrawVrMenuText(activeScale, VR_MENU_WIDTH/2, 692, 2,
 			fallback ? 255 : 120, fallback ? 95 : 220,
 			fallback ? 85 : 255);
 		DrawVrMenuText("NATIVE SCENE  SPATIAL AA SINGLE-FRAME",
-			VR_MENU_WIDTH/2, 700, 2, 170, 190, 210);
+			VR_MENU_WIDTH/2, 710, 2, 170, 190, 210);
 		if(scaleStatus.previousFallbackReason !=
 		   xrvk::RENDER_SCALE_FALLBACK_NONE){
 			char recoveredScale[192];
@@ -2906,19 +3109,19 @@ DrawQuestGraphicsPage(void)
 				scaleStatus.previousFallbackPercent,
 				xrvk::getRenderScaleFallbackReasonName(
 					scaleStatus.previousFallbackReason));
-			DrawVrMenuText(recoveredScale, VR_MENU_WIDTH/2, 722, 2,
+			DrawVrMenuText(recoveredScale, VR_MENU_WIDTH/2, 728, 2,
 				255, 105, 85);
 		}
 	}
 	if(gOcclusionCullingMode >= VR_OCCLUSION_CULLING_AUTHORED)
 		DrawVrMenuText("AUTHORED CULLING IS EXPERIMENTAL: USE STEREO SAFE IF EYES DISAGREE",
-			VR_MENU_WIDTH/2, 690, 2, 255, 105, 95);
+			VR_MENU_WIDTH/2, 746, 2, 255, 105, 95);
 	else if(gQuestRenderScalePercent >= 150)
 		DrawVrMenuText("150/175% IS EXPERIMENTAL: HIGH GPU AND MEMORY LOAD",
-			VR_MENU_WIDTH/2, 690, 2, 255, 120, 95);
+			VR_MENU_WIDTH/2, 746, 2, 255, 120, 95);
 	else if(gQuestRenderScalePercent > 100)
 		DrawVrMenuText("HIGHER SCALE SHARPENS THE IMAGE BUT INCREASES GPU LOAD",
-			VR_MENU_WIDTH/2, 690, 2, 255, 175, 95);
+			VR_MENU_WIDTH/2, 746, 2, 255, 175, 95);
 }
 
 static void
@@ -2940,15 +3143,67 @@ DrawQuestWeaponsPage(void)
 }
 
 static void
+DrawQuestLightingPage(void)
+{
+	BeginFullVrMenuPage("EFFECTS",
+		"DYNAMIC LIGHTS, AIR GLOW AND CAR REFLECTIONS");
+	char rows[VR_LIGHTING_ITEM_COUNT][112];
+	snprintf(rows[VR_LIGHTING_MODE], sizeof(rows[0]),
+		"MODE  < %s >",
+		gDynamicLights >= 2 ? "ON + AIR GLOW" :
+		gDynamicLights == 1 ? "ON" : "OFF");
+	snprintf(rows[VR_LIGHTING_INTENSITY], sizeof(rows[0]),
+		"LIGHT INTENSITY  < %d%% >", gDynamicLightIntensity);
+	snprintf(rows[VR_LIGHTING_GLOW_INTENSITY], sizeof(rows[0]),
+		"AIR GLOW INTENSITY  < %d%% >", gDynamicLightGlowIntensity);
+	snprintf(rows[VR_LIGHTING_MAX_LIGHTS], sizeof(rows[0]),
+		"MAX LIGHTS  < %d >", gDynamicLightMax);
+	snprintf(rows[VR_LIGHTING_CAR_REFLECTIONS], sizeof(rows[0]),
+		"CAR REFLECTIONS  < %s >",
+		gCarReflections ? "ON" : "OFF");
+	snprintf(rows[VR_LIGHTING_REFLECTION_INTENSITY], sizeof(rows[0]),
+		"REFLECTION INTENSITY  < %d%% >", gCarReflectionIntensity);
+	snprintf(rows[VR_LIGHTING_REFLECTION_SSR], sizeof(rows[0]),
+		"SSR STRENGTH  < %d%% >", gCarReflectionSsr);
+	if(gCarReflectionSsrDistance == 0)
+		snprintf(rows[VR_LIGHTING_SSR_DISTANCE], sizeof(rows[0]),
+			"SSR DISTANCE  < UNLIMITED >");
+	else
+		snprintf(rows[VR_LIGHTING_SSR_DISTANCE], sizeof(rows[0]),
+			"SSR DISTANCE  < %dM >", gCarReflectionSsrDistance);
+	snprintf(rows[VR_LIGHTING_SSR_SCALE], sizeof(rows[0]),
+		"SSR RESOLUTION  < %s - RESTART >",
+		gCarReflectionScale == 1 ? "FULL" :
+		gCarReflectionScale == 2 ? "HALF" :
+		gCarReflectionScale == 4 ? "QUARTER" : "EIGHTH");
+	strcpy(rows[VR_LIGHTING_BACK], "BACK TO GRAPHICS");
+	for(int item = 0; item < VR_LIGHTING_ITEM_COUNT; item++)
+		DrawFullVrMenuRow(rows[item], 166+item*40, 2,
+			item == gVrLightingSelection, true, false);
+	DrawVrMenuText("INTENSITY TAMES NEON-DENSE STREETS LIKE OCEAN DRIVE",
+		VR_MENU_WIDTH/2, 620, 2, 170, 190, 210);
+	DrawVrMenuText("SSR 0% OR A SHORT SSR DISTANCE GIVES THE CLASSIC LOOK",
+		VR_MENU_WIDTH/2, 644, 2, 170, 190, 210);
+}
+
+static void
 DrawQuestTrafficPage(void)
 {
 	BeginFullVrMenuPage("TRAFFIC SETTINGS",
 		"LIVE DENSITY - SAFE ENTITIES CONVERGE WITHOUT HARD DELETION");
 	char rows[VR_TRAFFIC_ITEM_COUNT][112];
-	snprintf(rows[VR_TRAFFIC_PEDESTRIANS], sizeof(rows[0]),
-		"PEDESTRIANS  < %d%% >", gTrafficPedPercent);
-	snprintf(rows[VR_TRAFFIC_VEHICLES], sizeof(rows[0]),
-		"VEHICLES  < %d%% >", gTrafficCarPercent);
+	// Zero reads as OFF: no new spawns. What is already on the street
+	// stays and leaves on its own, which is what the page promises.
+	if(gTrafficPedPercent == 0)
+		strcpy(rows[VR_TRAFFIC_PEDESTRIANS], "PEDESTRIANS  < OFF >");
+	else
+		snprintf(rows[VR_TRAFFIC_PEDESTRIANS], sizeof(rows[0]),
+			"PEDESTRIANS  < %d%% >", gTrafficPedPercent);
+	if(gTrafficCarPercent == 0)
+		strcpy(rows[VR_TRAFFIC_VEHICLES], "VEHICLES  < OFF >");
+	else
+		snprintf(rows[VR_TRAFFIC_VEHICLES], sizeof(rows[0]),
+			"VEHICLES  < %d%% >", gTrafficCarPercent);
 	snprintf(rows[VR_TRAFFIC_PHYSICS_DIRECTOR], sizeof(rows[0]),
 		"PHYSICS DIRECTOR  < %s >",
 		QuestPhysicsDirectorGetModeName());
@@ -3692,6 +3947,9 @@ VrDebugPixels(int *width, int *height)
 		case VR_MENU_PAGE_GRAPHICS:
 			DrawQuestGraphicsPage();
 			break;
+		case VR_MENU_PAGE_LIGHTING:
+			DrawQuestLightingPage();
+			break;
 		case VR_MENU_PAGE_WEAPONS:
 			DrawQuestWeaponsPage();
 			break;
@@ -4037,6 +4295,13 @@ VrCutsceneMode(void)
 	return gCutsceneMode;
 }
 
+int
+VrFoliageSoftness(void)
+{
+	LoadVrSettings();
+	return gFoliageSoftness;
+}
+
 bool
 VrRenderDiagnostics(void)
 {
@@ -4056,6 +4321,126 @@ VrGenerateMipmaps(void)
 {
 	LoadVrSettings();
 	return gGenerateMipmaps != 0;
+}
+
+// Hands the backend this frame's dynamic lights, nearest first. Read before
+// Step runs, so the list is the one the previous frame completed --
+// InitPerFrame clears it early in Idle and the entities refill it during
+// simulation and PreRender. One frame of latency on a light pool is
+// invisible; reading a half-built list is not.
+void
+VrPushDynamicLights(void)
+{
+	LoadVrSettings();
+	rw::vulkan::setCarReflectionsEnabled(gCarReflections);
+	rw::vulkan::setCarReflectionParams(gCarReflectionIntensity/100.0f,
+		gCarReflectionSsr/100.0f,
+		gCarReflectionSsrDistance == 0 ?
+			100000.0f : (float)gCarReflectionSsrDistance);
+	// The vehicle the player sits in, if any: its bonnet is the least
+	// rewarding case a screen-space lookup has -- it mostly finds the car
+	// itself -- so the backend keeps that one car on the panorama layer.
+	CVehicle *playerVehicle = FindPlayerVehicle();
+	if(playerVehicle != nil){
+		const CVector vehiclePosition = playerVehicle->GetPosition();
+		rw::vulkan::setPlayerVehicle(&vehiclePosition.x,
+			playerVehicle->GetColModel()->boundingSphere.radius, true);
+	}else
+		rw::vulkan::setPlayerVehicle(nil, 0.0f, false);
+	if(!gDynamicLights){
+		rw::vulkan::setPointLights(nil, 0, 0.0f);
+		return;
+	}
+
+	struct Candidate { float distance; int index; };
+	Candidate candidates[NUMPOINTLIGHTS];
+	int candidateCount = 0;
+	const CVector camPos = TheCamera.GetPosition();
+	for(int i = 0; i < CPointLights::NumLights; i++){
+		const CRegisteredPointLight &light = CPointLights::aLights[i];
+		// Fog-only entries feed CPointLights::RenderFogEffect, and DARKEN
+		// scales the ambient down instead of adding anything; neither is a
+		// light source the shaders could apply.
+		if(light.type != CPointLights::LIGHT_POINT &&
+		   light.type != CPointLights::LIGHT_DIRECTIONAL)
+			continue;
+		// Street lamps that are off still register a black light for their
+		// static shadow; skip those and anything degenerate.
+		if(light.radius <= 0.0f ||
+		   (light.red <= 0.0f && light.green <= 0.0f && light.blue <= 0.0f))
+			continue;
+		Candidate candidate;
+		candidate.distance =
+			(light.coors - camPos).Magnitude() - light.radius;
+		candidate.index = i;
+		candidates[candidateCount++] = candidate;
+	}
+
+	// Selection hysteresis. With a small MAX LIGHTS the runner-up scores sit
+	// close together, and while driving the winners traded places every few
+	// frames -- the cabin pulsed between the tail light's red and the street
+	// lamps' white. A light keeps its seat until a challenger beats it by a
+	// clear margin; matching is by position, loose enough to follow the
+	// player's own lights down the road.
+	static CVector heldPicks[rw::vulkan::MAX_POINT_LIGHTS];
+	static int heldPickCount;
+	for(int i = 0; i < candidateCount; i++){
+		const CVector &coors =
+			CPointLights::aLights[candidates[i].index].coors;
+		for(int j = 0; j < heldPickCount; j++)
+			if((coors - heldPicks[j]).MagnitudeSqr() < 9.0f){
+				candidates[i].distance -= 5.0f;
+				break;
+			}
+	}
+
+	// The backend takes eight of up to thirty-two; the ones whose spheres
+	// reach closest to the camera matter most.
+	for(int i = 1; i < candidateCount; i++){
+		const Candidate candidate = candidates[i];
+		int j = i-1;
+		for(; j >= 0 && candidates[j].distance > candidate.distance; j--)
+			candidates[j+1] = candidates[j];
+		candidates[j+1] = candidate;
+	}
+
+	rw::vulkan::PointLight lights[rw::vulkan::MAX_POINT_LIGHTS];
+	const int count = Min(candidateCount,
+		Min(gDynamicLightMax, (int)rw::vulkan::MAX_POINT_LIGHTS));
+	const float intensity = gDynamicLightIntensity/100.0f;
+	// A light that joins the nearest-N set deep inside its own radius would
+	// pop in at full strength -- driving down a lamp-lined street it reads
+	// as blinking. Fading the tail of the selection against the first light
+	// that did NOT make the cut keeps membership changes silent: by the
+	// time a light crosses the boundary its weight is already zero.
+	const float boundary = candidateCount > count ?
+		candidates[count].distance : 1e9f;
+	for(int i = 0; i < count; i++){
+		const CRegisteredPointLight &src =
+			CPointLights::aLights[candidates[i].index];
+		const float fade =
+			Min(1.0f, (boundary - candidates[i].distance)/6.0f);
+		rw::vulkan::PointLight &dst = lights[i];
+		dst.position[0] = src.coors.x;
+		dst.position[1] = src.coors.y;
+		dst.position[2] = src.coors.z;
+		dst.radius = src.radius;
+		dst.colour[0] = src.red*intensity*fade;
+		dst.colour[1] = src.green*intensity*fade;
+		dst.colour[2] = src.blue*intensity*fade;
+		dst.spot = src.type == CPointLights::LIGHT_DIRECTIONAL;
+		dst.direction[0] = src.dir.x;
+		dst.direction[1] = src.dir.y;
+		dst.direction[2] = src.dir.z;
+	}
+	heldPickCount = count;
+	for(int i = 0; i < count; i++)
+		heldPicks[i] = CPointLights::aLights[candidates[i].index].coors;
+
+	// The glow scale is on top of the light colours, which already carry the
+	// intensity; 0.14 is the tuned baseline the shader used to hard-code.
+	rw::vulkan::setPointLights(lights, count, gDynamicLights >= 2 ?
+		0.14f*(gDynamicLightGlowIntensity/100.0f) : 0.0f);
 }
 
 bool

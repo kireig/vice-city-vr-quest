@@ -164,8 +164,14 @@ bool VrFxaaEnabled(void);
 bool VrGenerateMipmaps(void);
 // The PS2 two-pass alpha rule for masked geometry.
 bool VrPs2AlphaTest(void);
+// Hands the backend the game's point lights for per-pixel lighting; call
+// once per frame before Step. Pushes an empty list when the player has the
+// setting off.
+void VrPushDynamicLights(void);
 // Renderer counters in logcat, off unless asked for.
 bool VrRenderDiagnostics(void);
+// Mip bias for masked geometry, in half levels.
+int VrFoliageSoftness(void);
 // How a cutscene is presented: 0 the flat theater screen, 1 stereo from
 // the director camera.
 int VrCutsceneMode(void);

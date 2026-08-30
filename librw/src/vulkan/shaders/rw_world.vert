@@ -12,6 +12,8 @@ layout(location = 0) out vec4 fragColour;
 layout(location = 1) out vec2 fragTexCoord;
 layout(location = 2) out float fragFog;
 layout(location = 3) flat out vec2 fragDynamicMotion;
+layout(location = 4) out vec3 fragWorldPos;
+layout(location = 5) out vec3 fragNormal;
 
 // Lighting is evaluated per vertex, matching what the original fixed-function
 // RenderWare pipeline did. Moving it to the fragment stage would look slightly
@@ -41,6 +43,10 @@ void main()
 
 	fragColour = vec4(clamp(colour, 0.0, 1.0), inColour.a) * push.materialColour;
 	fragTexCoord = inTexCoord;
+	// For the per-pixel dynamic lights. Prelit world sectors carry a dummy
+	// normal; surfaceProps.z tells the fragment stage whether this one is real.
+	fragWorldPos = world.xyz;
+	fragNormal = normal;
 
 	// Fog by distance from the eye rather than by depth along the view axis.
 	// Planar depth makes the fog a wall perpendicular to the gaze, and in a

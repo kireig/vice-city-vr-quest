@@ -37,7 +37,7 @@ This repository contains the original Quest/OpenXR port layer, Vulkan backend
 changes, build scripts and reVC patch files needed to build Vice City VR for a
 Meta Quest headset.
 
-Current source-kit version: **v0.5.1 alpha**.
+Current source-kit version: **v0.5.4 alpha**.
 
 It intentionally contains **no APK, complete reVC source tree, original game
 files, saves, logs or third-party Modern model packs**. Every user builds their
@@ -88,6 +88,9 @@ The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
 ## Current Quest build
 
 - Native arm64 Android application using OpenXR and Vulkan multiview.
+- Room scale: the headset is the camera in the world, so walking, leaning
+  and ducking in the play space move the player's viewpoint through Vice
+  City rather than only turning it.
 - Physical VR weapons, two-hand support, holsters and scoped aiming.
 - Physical steering for cars and motorcycles, including model steering wheels.
 - In-headset VR, calibration, cheats, traffic, graphics and model-set menus.
@@ -95,10 +98,33 @@ The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
   the grips and the stick clicks each pick the game action they trigger, with a
   SWAPPED HANDS layout that moves jump and enter/exit to the right controller.
 - Stereo-safe building culling with an exact OFF fallback.
+- Mip chains built at load for a game that shipped none. Vice City stores
+  every world texture at a single level, so distant fences, signs and
+  foliage were minified straight off the full-size image and crawled with
+  every head movement. The port filters the missing levels on a worker
+  thread, weighted by alpha so cut-out masks keep their colour. The
+  player's own TXD files are never modified.
+- Optional per-pixel dynamic lights: headlights, explosions, street lamps
+  and neon applied to the world instead of only to peds and vehicles, with
+  an air-glow mode that makes a source visible in the air and not only as
+  its pool on the ground. Intensity, glow and light count are adjustable.
+  Off by default -- it costs GPU on a lamp-dense block.
+- Optional vehicle reflections. RenderWare drew env-map materials with a
+  second textured pass this backend never had, so cars had none; what
+  ships is screen-space, reprojecting the previous frame onto the bodywork
+  over the model's own streak art. Strength, range and sampled resolution
+  are adjustable. Off by default -- it is the most expensive option here.
+- Optional PS2 two-pass alpha rule for masked geometry, which removes the
+  faint outline a railing or fence carves out of the wall behind it. Off
+  by default: it draws every masked mesh twice, and a Vice City street is
+  mostly railings, fences and foliage.
+- Stereo cutscenes: the director camera can be rendered in the headset
+  instead of on the flat theatre screen, with selectable staged cameras
+  per scene. CINEMA remains available.
 - Physics Director V2 is enabled by default for CPU headroom, remains
   experimental, and has an exact ORIGINAL/OFF fallback in the Traffic menu.
 - Classic/Modern asset categories; no external model pack is included.
-- Default quality profile: 125% render scale, sustained CPU/GPU hints,
+- Default quality profile: 100% render scale, sustained CPU/GPU hints,
   Spatial AA, AUTHORED occlusion culling, Modern world textures/weapons and
   Classic vehicles, pedestrians and vegetation when a user-built Modern
   overlay is available. AUTHORED gives substantially better performance but
@@ -106,10 +132,17 @@ The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
   eyes or disappears incorrectly.
 - Modern vehicles can be expensive on Quest, especially with high traffic;
   Classic vehicles remain the default and the recommended fallback.
+- Pedestrian and vehicle density run from OFF to 300%. OFF stops new
+  spawns rather than deleting what is already on the street.
 - Normal frontend/save loading on first launch; the developer Quick Test Start
   shortcut remains available but is off by default.
 
-Experimental temporal AA, SGSR, MSAA and runtime-only foveation are disabled:
+Multisampling is available as OFF/2X/4X. It smooths the edges the rasteriser
+itself creates -- railings, poles, wires -- and deliberately leaves masks to
+the mip chain: alpha to coverage was tried on top of it and turned every
+leaf and neon tube into a dither lattice.
+
+Experimental temporal AA, SGSR and runtime-only foveation remain disabled:
 headset testing did not establish a safe visual or performance benefit.
 
 Runtime/data layout is documented in

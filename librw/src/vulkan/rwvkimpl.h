@@ -69,6 +69,10 @@ struct RenderState
 	// dropping it on the floor; d3d9 and gl3 have carried it all along.
 	uint32 gsAlphaTest;
 	uint32 gsAlphaTestRef;
+	// Mip level bias in half steps, for the draw only. High-frequency
+	// leaf masks sparkle at distance; biasing them a level or two down
+	// the chain is what a temporal filter would have done for free.
+	uint32 mipLodBias;
 	uint32 fogEnabled;
 	RGBA fogColor;
 	// Set through SetRenderStatePtr(TEXTURERASTER). Immediate mode reads it
@@ -124,6 +128,16 @@ struct FrameContext
 	VkFramebuffer sceneFramebuffer;
 	VkDescriptorSet postFxDescriptor;
 	bool32 sceneColourInitialised;
+	// Reduced copy of the finished frame, for the reflection block to
+	// sample instead of the full image. Built on the theory that the
+	// scattered lookup was missing the texture cache; measuring says
+	// otherwise -- a quarter-resolution copy moved the frame time by
+	// nothing. It stays as a knob, not as a fix, and the size the
+	// player picks includes reading the frame itself.
+	VkImage sceneReflectionImage;
+	VkDeviceMemory sceneReflectionMemory;
+	VkImageView sceneReflectionView;
+	bool32 sceneReflectionInitialised;
 
 	// V3 temporal history stores the already resolved (but not colour-filtered)
 	// result. It is allocated only for SGSR2_RESOLVED_TEMPORAL_V3.
@@ -241,6 +255,17 @@ struct Globals
 	// beginUpdate and folded into each draw's model matrix. Captured when the
 	// draw is recorded, so a frame that switches cameras stays correct.
 	float32 worldToPlay[16];
+	// The fold the submitted frame's world draws used, captured in endFrame;
+	// the reflection reprojection needs it to move a probe from this frame's
+	// play space into the one the sampled image was rendered in.
+	float32 worldToPlaySubmitted[16];
+	// And the eye matrices that frame rendered with, captured the same way.
+	// scene.previousViewProj is NOT usable for this: it falls back to the
+	// CURRENT matrices whenever temporalHistoryValid is off -- which with
+	// SGSR disabled is always -- and a current-pose lookup into a one-frame-
+	// old image makes every reflection stick to the head and snap back.
+	float32 reflectionPrevViewProj[2][16];
+	bool32 reflectionPrevValid;
 	// Mid-eye pose in play space, updated once per frame by the app layer.
 	float32 headPosition[3];
 	float32 headYaw;
@@ -264,6 +289,37 @@ struct Globals
 	// Linear fog planes, supplied by the game from its time cycle.
 	float32 fogStart;
 	float32 fogEnd;
+	// This frame's dynamic lights, world space, straight from the game's
+	// point light list. The play-space copy the shaders read is derived from
+	// these against the current camera fold; see refreshScenePointLights.
+	// The world-space originals also feed the per-draw light masks in
+	// drawAtomicMeshes, together with the camera's world position.
+	PointLight pointLights[MAX_POINT_LIGHTS];
+	uint32 pointLightCount;
+	// Zero disables the air-glow term and its per-draw mask work entirely.
+	float32 pointLightGlowStrength;
+	float32 cameraWorldPos[3];
+	bool32 carReflections;
+	// The reduced copy above: its size, and whether the colour format
+	// can be blitted into it with a linear filter at all. Without the
+	// blit the reflection stays on the full-resolution image.
+	uint32 sceneReflectionDivisor;
+	uint32 sceneReflectionWidth;
+	uint32 sceneReflectionHeight;
+	bool32 sceneReflectionBlit;
+	// The last MatFX env-map raster a draw carried. Vice City's vehicles all
+	// share the same few streak textures, so one global binding (set 3, once
+	// per frame) serves them all; cleared when the raster is destroyed.
+	Raster *envRaster;
+	// The vehicle the player occupies; its atomics keep the panorama
+	// reflection layer only. See setPlayerVehicle.
+	float32 playerVehiclePos[3];
+	float32 playerVehicleRadius;
+	bool32 playerVehicleActive;
+	// Player-tuned reflection strengths; see setCarReflectionParams.
+	float32 carReflectionIntensity;
+	float32 carReflectionSsr;
+	float32 carReflectionSsrDistance;
 
 	// First person anchor: the player's head in the game world. anchorYaw is
 	// the world yaw that play-space forward maps to. On foot it is latched at
@@ -349,12 +405,28 @@ struct SceneData
 	float32 fogColour[4];
 	float32 fogParams[4];
 	float32 ambient[4];
-	float32 lightDirection[8][4];
+	// The frame's dynamic lights in play space; see refreshScenePointLights.
+	// xyz = position, w = radius / rgb = colour / xyz = cone axis, w = cone.
+	float32 lightPosRad[8][4];
 	float32 lightColour[8][4];
+	float32 lightDir[8][4];
 	float32 lightCount[4];
 	float32 im2dTransform[16];
 	// x = Im2D plane distance, yzw = eye position in play space.
 	float32 im2dParams[4];
+	// The timecycle sky top the render pass clears to; the vehicle env
+	// reflection mixes toward it away from the horizon's fog colour.
+	float32 skyColour[4];
+	// Current play space to the previous frame's clip, per eye: previous
+	// view projection composed with the fold delta between the two frames.
+	// See refreshSceneReprojection.
+	float32 reflectionReproject[2][16];
+	// 16x16 screen cells per eye that interface (Im2D) draws touched in the
+	// frame the reflections sample: words 0-7 left eye, 8-15 right eye.
+	uint32 im2dCoverage[16];
+	// x = overall reflection intensity, y = SSR weight inside it; the
+	// player tunes both from the EFFECTS page.
+	float32 reflectionParams[4];
 };
 
 // Mirrors PushConstants in rw_common.glsl. Exactly 128 bytes -- the guaranteed
@@ -439,6 +511,20 @@ VkDeviceSize getBoneBlockAlignment(void);
 SceneData *getSceneData(void);
 void setStateFrame(uint32 frame);
 void uploadSceneData(void);
+// Writes and binds set 3 -- env streak texture + previous frame's scene
+// colour -- for the reflection block; previousScene may be null before the
+// first frame exists.
+void bindEnvironmentDescriptor(VkCommandBuffer commandBuffer,
+                               VkImageView previousScene);
+// Rebuilds the play-space dynamic lights in the scene block from the
+// world-space list the game pushed; call before uploadSceneData whenever
+// worldToPlay may have changed.
+void refreshScenePointLights(void);
+// Rebuilds the reflection reprojection matrices; same rule as the lights.
+void refreshSceneReprojection(void);
+// Reads back and clears the interface coverage mask the Im2D fragments of
+// this slot's previous run wrote; call after the slot's fence is waited.
+void readAndResetCoverage(uint32 out[16]);
 
 // Bump allocator over a per-frame host-visible buffer. Reset in beginFrame,
 // which is safe because beginFrame has already waited on the previous frame's

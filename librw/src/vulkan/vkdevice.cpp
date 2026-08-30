@@ -413,8 +413,11 @@ createSceneColour(FrameContext &frame)
 	imageInfo.arrayLayers = gvk.viewCount;
 	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	// TRANSFER_SRC as well: the reduced copy the reflection samples is
+	// blitted out of this image once the frame is finished.
 	imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-	                  VK_IMAGE_USAGE_SAMPLED_BIT;
+	                  VK_IMAGE_USAGE_SAMPLED_BIT |
+	                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	if(vkCreateImage(gvk.device, &imageInfo, nil,
 	                 &frame.sceneColourImage) != VK_SUCCESS){
@@ -466,6 +469,183 @@ createSceneColour(FrameContext &frame)
 		VKERR("failed to create post-FX scene colour view");
 		return 0;
 	}
+	return 1;
+}
+
+// How far down the finished frame is taken before the reflection block
+// samples it, when the player has not chosen. Four costs a blit and a
+// sixteenth of the memory, and a reflection on car paint loses nothing
+// it was showing -- but it does not buy frame time either, which is the
+// whole reason it was tried. Left at four because the softer reflection
+// is the better-looking of two equals.
+enum { SCENE_REFLECTION_DIVISOR = 4 };
+
+// Decides how big the reduced copy is and whether it can be produced at all.
+// A format that cannot be blitted with a linear filter leaves the reflection
+// on the full image rather than losing it.
+static void
+chooseSceneReflectionSize(void)
+{
+	VkFormatProperties properties = {};
+	vkGetPhysicalDeviceFormatProperties(gvk.physicalDevice,
+	                                    gvk.colourFormat, &properties);
+	const VkFormatFeatureFlags needed =
+		VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+		VK_FORMAT_FEATURE_BLIT_DST_BIT |
+		VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+	uint32 divisor = gvk.sceneReflectionDivisor;
+	if(divisor != 1 && divisor != 2 && divisor != 4 && divisor != 8)
+		divisor = SCENE_REFLECTION_DIVISOR;
+	// A divisor of one is the reflection reading the frame itself, so
+	// there is no copy to make and none to allocate.
+	gvk.sceneReflectionBlit = divisor > 1 &&
+		(properties.optimalTilingFeatures & needed) == needed;
+	gvk.sceneReflectionWidth = gvk.sceneWidth/divisor;
+	gvk.sceneReflectionHeight = gvk.sceneHeight/divisor;
+	if(gvk.sceneReflectionWidth < 1)
+		gvk.sceneReflectionWidth = 1;
+	if(gvk.sceneReflectionHeight < 1)
+		gvk.sceneReflectionHeight = 1;
+	if(gvk.sceneReflectionBlit)
+		VKLOG("reflection scene copy %ux%u from %ux%u (1/%u)",
+		      gvk.sceneReflectionWidth, gvk.sceneReflectionHeight,
+		      gvk.sceneWidth, gvk.sceneHeight, divisor);
+	else
+		VKLOG("reflection reads the full %ux%u frame (%s)",
+		      gvk.sceneWidth, gvk.sceneHeight,
+		      divisor == 1 ? "by request" : "format cannot blit");
+}
+
+static bool32
+createSceneReflection(FrameContext &frame)
+{
+	if(!gvk.sceneReflectionBlit)
+		return 1;
+	VkImageCreateInfo imageInfo = {};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.format = gvk.colourFormat;
+	imageInfo.extent.width = gvk.sceneReflectionWidth;
+	imageInfo.extent.height = gvk.sceneReflectionHeight;
+	imageInfo.extent.depth = 1;
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = gvk.viewCount;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+	                  VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if(vkCreateImage(gvk.device, &imageInfo, nil,
+	                 &frame.sceneReflectionImage) != VK_SUCCESS){
+		VKERR("failed to create reflection scene copy");
+		return 0;
+	}
+
+	VkMemoryRequirements requirements;
+	vkGetImageMemoryRequirements(gvk.device, frame.sceneReflectionImage,
+	                             &requirements);
+	uint32 typeIndex = UINT32_MAX;
+	if(!findMemoryType(requirements.memoryTypeBits,
+	                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex)){
+		vkDestroyImage(gvk.device, frame.sceneReflectionImage, nil);
+		frame.sceneReflectionImage = VK_NULL_HANDLE;
+		return 0;
+	}
+	VkMemoryAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = requirements.size;
+	allocInfo.memoryTypeIndex = typeIndex;
+	if(vkAllocateMemory(gvk.device, &allocInfo, nil,
+	                    &frame.sceneReflectionMemory) != VK_SUCCESS){
+		vkDestroyImage(gvk.device, frame.sceneReflectionImage, nil);
+		frame.sceneReflectionImage = VK_NULL_HANDLE;
+		return 0;
+	}
+	if(vkBindImageMemory(gvk.device, frame.sceneReflectionImage,
+	                     frame.sceneReflectionMemory, 0) != VK_SUCCESS)
+		return 0;
+
+	VkImageViewCreateInfo viewInfo = {};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = frame.sceneReflectionImage;
+	// Bound where the full-resolution scene used to be, so the shader still
+	// declares a sampler2DArray and nothing there changes.
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+	viewInfo.format = gvk.colourFormat;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = gvk.viewCount;
+	if(vkCreateImageView(gvk.device, &viewInfo, nil,
+	                     &frame.sceneReflectionView) != VK_SUCCESS){
+		VKERR("failed to create reflection scene copy view");
+		return 0;
+	}
+	return 1;
+}
+
+// Reduces the finished frame into that copy. Runs after the world pass and
+// before the post pass, while the scene image holds the world and nothing
+// else. Returns true when it ran, which leaves the scene image in
+// TRANSFER_SRC rather than COLOR_ATTACHMENT for the barrier that follows.
+static bool32
+reduceSceneForReflection(FrameContext &frame)
+{
+	if(!gvk.carReflections || !gvk.sceneReflectionBlit ||
+	   frame.sceneReflectionImage == VK_NULL_HANDLE)
+		return 0;
+
+	VkImageMemoryBarrier barriers[2] = {};
+	barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	barriers[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barriers[0].image = frame.sceneColourImage;
+	barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	barriers[0].subresourceRange.levelCount = 1;
+	barriers[0].subresourceRange.layerCount = gvk.viewCount;
+	// The copy is overwritten whole, so its old contents are discarded; only
+	// the previous frame's sampling of it has to have finished.
+	barriers[1] = barriers[0];
+	barriers[1].srcAccessMask = frame.sceneReflectionInitialised ?
+		VK_ACCESS_SHADER_READ_BIT : 0;
+	barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	barriers[1].image = frame.sceneReflectionImage;
+	vkCmdPipelineBarrier(gvk.frameCommands,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, nil, 0, nil, 2, barriers);
+
+	VkImageBlit blit = {};
+	blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	blit.srcSubresource.layerCount = gvk.viewCount;
+	blit.srcOffsets[1].x = (int32)gvk.sceneWidth;
+	blit.srcOffsets[1].y = (int32)gvk.sceneHeight;
+	blit.srcOffsets[1].z = 1;
+	blit.dstSubresource = blit.srcSubresource;
+	blit.dstOffsets[1].x = (int32)gvk.sceneReflectionWidth;
+	blit.dstOffsets[1].y = (int32)gvk.sceneReflectionHeight;
+	blit.dstOffsets[1].z = 1;
+	vkCmdBlitImage(gvk.frameCommands,
+		frame.sceneColourImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		frame.sceneReflectionImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		1, &blit, VK_FILTER_LINEAR);
+
+	VkImageMemoryBarrier readBarrier = barriers[1];
+	readBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	readBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	readBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	readBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	vkCmdPipelineBarrier(gvk.frameCommands,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		0, 0, nil, 0, nil, 1, &readBarrier);
+	frame.sceneReflectionInitialised = 1;
 	return 1;
 }
 
@@ -2118,6 +2298,24 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 		scene->fogColour[2] = gstate.fogColor.blue/255.0f;
 		scene->fogColour[3] = 1.0f;
 	}
+	// The vehicle env reflection reads the same sky the pass clears to.
+	scene->skyColour[0] = gvk.clearColour[0];
+	scene->skyColour[1] = gvk.clearColour[1];
+	scene->skyColour[2] = gvk.clearColour[2];
+	scene->skyColour[3] = 1.0f;
+	// Where the interface drew two frames ago -- the same frame whose image
+	// the reflections sample -- so a help box never lands on a car body.
+	readAndResetCoverage(scene->im2dCoverage);
+	scene->lightCount[2] = (float32)gvk.sceneWidth;
+	scene->lightCount[3] = (float32)gvk.sceneHeight;
+	scene->reflectionParams[0] = gvk.carReflectionIntensity;
+	scene->reflectionParams[1] = gvk.carReflectionSsr;
+	scene->reflectionParams[2] = gvk.carReflectionSsrDistance;
+	scene->reflectionParams[3] = 0.0f;
+	// Under the previous frame's camera fold for now; the first beginUpdate of
+	// this frame re-derives them under the real one.
+	refreshScenePointLights();
+	refreshSceneReprojection();
 	uploadSceneData();
 
 	// The wrist panels render into their own targets here, while the frame is
@@ -2160,6 +2358,27 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 	VkDescriptorSet sceneSet = getSceneDescriptor();
 	vkCmdBindDescriptorSets(gvk.frameCommands, VK_PIPELINE_BIND_POINT_GRAPHICS,
 	                        getPipelineLayout(), 0, 1, &sceneSet, 0, nil);
+	// Set 3: the vehicle env streak texture plus the previous frame's scene
+	// colour, which the reflection block reprojects so a car shows the
+	// street that actually stands around it. With two frame contexts the
+	// other slot's image holds the frame the GPU finished last; the queue
+	// serialises against its writes, and after its post pass the image sits
+	// in SHADER_READ until that slot begins again.
+	{
+		const uint32 previousIndex =
+			(frameIndex + NUM_FRAME_CONTEXTS - 1)%NUM_FRAME_CONTEXTS;
+		const FrameContext &previous = gvk.frames[previousIndex];
+		// The reduced copy when there is one, and the frame itself when
+		// there is not -- either the player asked for full resolution
+		// or the colour format cannot be blitted.
+		VkImageView reflectionSource = VK_NULL_HANDLE;
+		if(previous.sceneReflectionInitialised)
+			reflectionSource = previous.sceneReflectionView;
+		else if(!gvk.sceneReflectionBlit &&
+		        previous.sceneColourInitialised)
+			reflectionSource = previous.sceneColourView;
+		bindEnvironmentDescriptor(gvk.frameCommands, reflectionSource);
+	}
 
 	VkViewport viewport = {};
 	viewport.width = (float32)gvk.sceneWidth;
@@ -2182,6 +2401,15 @@ endFrame(void)
 		return;
 	FrameContext &frame = gvk.frames[gvk.activeFrame];
 	reportImStats();
+	// The fold this frame's world draws went out under; the next frame's
+	// reflection reprojection moves its probes back into this space.
+	memcpy(gvk.worldToPlaySubmitted, gvk.worldToPlay,
+	       sizeof(gvk.worldToPlaySubmitted));
+	// And the matrices its image was projected with -- see the field comment
+	// for why scene.previousViewProj cannot serve here.
+	memcpy(gvk.reflectionPrevViewProj, gvk.stereoViewProjectionUnjittered,
+	       sizeof(gvk.reflectionPrevViewProj));
+	gvk.reflectionPrevValid = 1;
 
 	// Make the stored world image visible to the sampled post pass. This is a
 	// full-image dependency rather than BY_REGION because FXAA reads adjacent
@@ -2252,11 +2480,18 @@ endFrame(void)
 			vkCmdEndRenderPass(gvk.frameCommands);
 		}
 	}
+	// Take the reduced copy for the reflection first: it reads the scene
+	// image as a transfer source, which is a different layout from the
+	// one the post pass wants it in.
+	const bool32 reduced = reduceSceneForReflection(frame);
 	VkImageMemoryBarrier sceneBarrier = {};
 	sceneBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	sceneBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	sceneBarrier.srcAccessMask = reduced ? VK_ACCESS_TRANSFER_READ_BIT :
+		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 	sceneBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	sceneBarrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	sceneBarrier.oldLayout = reduced ?
+		VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL :
+		VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	sceneBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	sceneBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	sceneBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -2265,6 +2500,7 @@ endFrame(void)
 	sceneBarrier.subresourceRange.levelCount = 1;
 	sceneBarrier.subresourceRange.layerCount = gvk.viewCount;
 	vkCmdPipelineBarrier(gvk.frameCommands,
+	                     reduced ? VK_PIPELINE_STAGE_TRANSFER_BIT :
 	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 	                     0, 0, nil, 0, nil, 1, &sceneBarrier);
@@ -2537,6 +2773,8 @@ updateWorldToPlay(Camera *cam)
 		// vehicle basis so pitch/roll remain coherent in both eyes.
 		float32 px[3], py[3], pz[3];
 		getFirstPersonPlayBasis(px, py, pz);
+		memcpy(gvk.cameraWorldPos, gvk.fpHeadWorld,
+		       sizeof(gvk.cameraWorldPos));
 		float32 *m = gvk.worldToPlay;
 		m[0]  = px[0]; m[4] = px[1]; m[8]  = px[2];
 		m[1]  = py[0]; m[5] = py[1]; m[9]  = py[2];
@@ -2563,24 +2801,19 @@ updateWorldToPlay(Camera *cam)
 		memset(gvk.worldToPlay, 0, sizeof(gvk.worldToPlay));
 		gvk.worldToPlay[0] = gvk.worldToPlay[5] =
 		gvk.worldToPlay[10] = gvk.worldToPlay[15] = 1.0f;
+		memset(gvk.cameraWorldPos, 0, sizeof(gvk.cameraWorldPos));
 		return;
 	}
 
 	Matrix *ltm = cam->getFrame()->getLTM();
 
-	static int32 cameraLogCounter = 0;
-	if((cameraLogCounter++ % 120) == 0)
-		printf("[rwvk] cam pos %.1f %.1f %.1f | right %.2f %.2f %.2f | "
-		       "up %.2f %.2f %.2f | at %.2f %.2f %.2f\n",
-		       ltm->pos.x, ltm->pos.y, ltm->pos.z,
-		       ltm->right.x, ltm->right.y, ltm->right.z,
-		       ltm->up.x, ltm->up.y, ltm->up.z,
-		       ltm->at.x, ltm->at.y, ltm->at.z);
-
 	const V3d bx = neg(ltm->right);
 	const V3d by = ltm->up;
 	const V3d bz = neg(ltm->at);
 	const V3d origin = ltm->pos;
+	gvk.cameraWorldPos[0] = origin.x;
+	gvk.cameraWorldPos[1] = origin.y;
+	gvk.cameraWorldPos[2] = origin.z;
 
 	// Orthonormal basis, so the inverse is the transpose with the translation
 	// rotated back through it.
@@ -2601,6 +2834,123 @@ updateWorldToPlay(Camera *cam)
 	m[13] = -dot(by, origin) + gvk.headPosition[1];
 	m[14] = -dot(bz, origin) + gvk.headPosition[2];
 	m[15] = 1.0f;
+}
+
+void
+setPointLights(const PointLight *lights, uint32 count, float32 glowStrength)
+{
+	if(lights == nil)
+		count = 0;
+	if(count > MAX_POINT_LIGHTS)
+		count = MAX_POINT_LIGHTS;
+	if(count > 0)
+		memcpy(gvk.pointLights, lights, count*sizeof(PointLight));
+	gvk.pointLightCount = count;
+	gvk.pointLightGlowStrength = glowStrength > 0.0f ? glowStrength : 0.0f;
+}
+
+void
+setCarReflectionsEnabled(bool32 enabled)
+{
+	gvk.carReflections = enabled;
+}
+
+void
+setCarReflectionParams(float32 intensity, float32 ssrStrength,
+                       float32 ssrDistance)
+{
+	gvk.carReflectionIntensity = intensity > 0.0f ? intensity : 0.0f;
+	gvk.carReflectionSsr = ssrStrength > 0.0f ? ssrStrength : 0.0f;
+	gvk.carReflectionSsrDistance = ssrDistance > 1.0f ? ssrDistance : 1.0f;
+}
+
+void
+setPlayerVehicle(const float32 position[3], float32 radius, bool32 active)
+{
+	if(active && position != nil)
+		memcpy(gvk.playerVehiclePos, position,
+		       sizeof(gvk.playerVehiclePos));
+	gvk.playerVehicleRadius = radius > 2.0f ? radius : 2.0f;
+	gvk.playerVehicleActive = active && position != nil;
+}
+
+// Play-space copy of the frame's dynamic lights. The shaders compare these
+// against play-space geometry, and geometry reaches play space through
+// whatever worldToPlay holds when its draw is recorded -- so this is redone
+// after every camera update, not just once a frame, or the light pools would
+// trail the head by a frame.
+void
+refreshScenePointLights(void)
+{
+	SceneData *scene = getSceneData();
+	const float32 *m = gvk.worldToPlay;
+	const uint32 count = gvk.pointLightCount;
+	for(uint32 i = 0; i < count; i++){
+		const PointLight &light = gvk.pointLights[i];
+		const float32 x = light.position[0];
+		const float32 y = light.position[1];
+		const float32 z = light.position[2];
+		scene->lightPosRad[i][0] = m[0]*x + m[4]*y + m[8]*z + m[12];
+		scene->lightPosRad[i][1] = m[1]*x + m[5]*y + m[9]*z + m[13];
+		scene->lightPosRad[i][2] = m[2]*x + m[6]*y + m[10]*z + m[14];
+		scene->lightPosRad[i][3] = light.radius;
+		scene->lightColour[i][0] = light.colour[0];
+		scene->lightColour[i][1] = light.colour[1];
+		scene->lightColour[i][2] = light.colour[2];
+		scene->lightColour[i][3] = 0.0f;
+		const float32 dx = light.direction[0];
+		const float32 dy = light.direction[1];
+		const float32 dz = light.direction[2];
+		scene->lightDir[i][0] = m[0]*dx + m[4]*dy + m[8]*dz;
+		scene->lightDir[i][1] = m[1]*dx + m[5]*dy + m[9]*dz;
+		scene->lightDir[i][2] = m[2]*dx + m[6]*dy + m[10]*dz;
+		scene->lightDir[i][3] = light.spot ? 1.0f : 0.0f;
+	}
+	scene->lightCount[0] = (float32)count;
+	scene->lightCount[1] = gvk.pointLightGlowStrength;
+}
+
+// A reflection probe lives in THIS frame's play space, but the image it is
+// looked up in was rendered in LAST frame's -- and the fold between them
+// moves with every camera step. Left uncomposed, the reflection swims by one
+// frame of camera motion and snaps back, a wobble the headset makes very
+// visible. So build the whole round trip once on the CPU: current play ->
+// world -> submitted frame's play -> its clip.
+void
+refreshSceneReprojection(void)
+{
+	SceneData *scene = getSceneData();
+
+	// The fold is rigid (orthonormal basis, possibly mirrored), so the
+	// inverse is the transpose with the translation rotated back through it.
+	const float32 *m = gvk.worldToPlay;
+	float32 playToWorld[16];
+	playToWorld[0] = m[0]; playToWorld[4] = m[1]; playToWorld[8]  = m[2];
+	playToWorld[1] = m[4]; playToWorld[5] = m[5]; playToWorld[9]  = m[6];
+	playToWorld[2] = m[8]; playToWorld[6] = m[9]; playToWorld[10] = m[10];
+	playToWorld[3] = 0.0f; playToWorld[7] = 0.0f; playToWorld[11] = 0.0f;
+	playToWorld[12] = -(m[0]*m[12] + m[1]*m[13] + m[2]*m[14]);
+	playToWorld[13] = -(m[4]*m[12] + m[5]*m[13] + m[6]*m[14]);
+	playToWorld[14] = -(m[8]*m[12] + m[9]*m[13] + m[10]*m[14]);
+	playToWorld[15] = 1.0f;
+
+	// Before the first frame is submitted there is no captured fold; using
+	// the current one degrades to a plain previous-view projection.
+	const float32 *submitted = gvk.worldToPlaySubmitted[15] != 0.0f ?
+		gvk.worldToPlaySubmitted : gvk.worldToPlay;
+	float32 foldDelta[16];
+	multiplyMatrix(foldDelta, submitted, playToWorld);
+
+	for(int32 eye = 0; eye < 2; eye++){
+		float32 composed[16];
+		multiplyMatrix(composed,
+		               gvk.reflectionPrevValid ?
+		               gvk.reflectionPrevViewProj[eye] :
+		               gvk.stereoViewProjectionUnjittered[eye],
+		               foldDelta);
+		memcpy(scene->reflectionReproject[eye], composed,
+		       sizeof(composed));
+	}
 }
 
 void
@@ -3079,6 +3429,19 @@ getPs2AlphaTestEnabled(void)
 }
 
 static bool32 gRenderDiagnostics;
+static uint32 gMaskedMipBias;
+
+void
+setMaskedMipBias(uint32 halfLevels)
+{
+	gMaskedMipBias = halfLevels > 3 ? 3 : halfLevels;
+}
+
+uint32
+getMaskedMipBias(void)
+{
+	return gMaskedMipBias;
+}
 
 void
 setRenderDiagnostics(bool32 enabled)
@@ -3161,6 +3524,16 @@ beginUpdate(Camera *cam)
 	// and librw derives the view matrix from it. Multiview needs both eyes at
 	// once, so the composition happens here instead.
 	updateWorldToPlay(cam);
+	// The dynamic lights follow the fold. Mid-recording the rewrite is safe --
+	// the scene buffer is host visible and the GPU reads it at submit, so the
+	// last camera of the frame wins, exactly as it does for the fold itself.
+	// Outside a frame the GPU may be reading the mapped block right now, and
+	// there is nothing to light anyway.
+	if(gvk.inFrame){
+		refreshScenePointLights();
+		refreshSceneReprojection();
+		uploadSceneData();
+	}
 }
 
 static void
@@ -3442,12 +3815,18 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 			VKLOG("GPU frame timestamps unavailable on queue family %u",
 			      gvk.queueFamilyIndex);
 
+		gvk.sceneReflectionDivisor = params->sceneReflectionDivisor;
+		chooseSceneReflectionSize();
 		for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++){
 			if(!createDepthBuffer(gvk.frames[i])){
 				gLastDeviceOpenRenderTargetFailure = 1;
 				return 0;
 			}
 			if(!createSceneColour(gvk.frames[i])){
+				gLastDeviceOpenRenderTargetFailure = 1;
+				return 0;
+			}
+			if(!createSceneReflection(gvk.frames[i])){
 				gLastDeviceOpenRenderTargetFailure = 1;
 				return 0;
 			}
@@ -3583,6 +3962,15 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 				if(frame.sceneColourMemory)
 					vkFreeMemory(gvk.device,
 						             frame.sceneColourMemory, nil);
+				if(frame.sceneReflectionView)
+					vkDestroyImageView(gvk.device,
+					                   frame.sceneReflectionView, nil);
+				if(frame.sceneReflectionImage)
+					vkDestroyImage(gvk.device,
+					               frame.sceneReflectionImage, nil);
+				if(frame.sceneReflectionMemory)
+					vkFreeMemory(gvk.device,
+						             frame.sceneReflectionMemory, nil);
 				if(frame.sceneMsaaView)
 					vkDestroyImageView(gvk.device,
 					                   frame.sceneMsaaView, nil);

@@ -108,14 +108,32 @@ static void downsample(const std::vector<u8> &src,int w,int h,std::vector<u8> &d
 {
 	nw=w>1?w/2:1; nh=h>1?h/2:1;
 	dst.resize((size_t)nw*nh*4);
+	// Weighted by alpha. A plain average pulls in the colour of texels
+	// that are not there: the cut-out half of a leaf or a neon tube is
+	// whatever the artist left behind the mask, usually black, and mixing
+	// it into the edge darkens every level a little more than the last.
+	// On a mask full of small shapes that reads as a lattice.
 	for(int y=0;y<nh;y++) for(int x=0;x<nw;x++){
 		int sx=x*2, sy=y*2;
 		int sx1=sx+1<w?sx+1:sx, sy1=sy+1<h?sy+1:sy;
-		for(int c=0;c<4;c++){
-			int v=src[(sy*w+sx)*4+c]+src[(sy*w+sx1)*4+c]+
-			      src[(sy1*w+sx)*4+c]+src[(sy1*w+sx1)*4+c];
-			dst[(y*(size_t)nw+x)*4+c]=(u8)(v/4);
+		const size_t s[4]={(size_t)(sy*w+sx),(size_t)(sy*w+sx1),
+		                   (size_t)(sy1*w+sx),(size_t)(sy1*w+sx1)};
+		int alphaSum=0;
+		for(int i=0;i<4;i++) alphaSum+=src[s[i]*4+3];
+		for(int c=0;c<3;c++){
+			int v=0;
+			if(alphaSum>0){
+				for(int i=0;i<4;i++) v+=src[s[i]*4+c]*src[s[i]*4+3];
+				v/=alphaSum;
+			}else{
+				// Nothing visible to weight by; keep the plain average so
+				// a fully cut-out corner still carries a sane colour.
+				for(int i=0;i<4;i++) v+=src[s[i]*4+c];
+				v/=4;
+			}
+			dst[(y*(size_t)nw+x)*4+c]=(u8)v;
 		}
+		dst[(y*(size_t)nw+x)*4+3]=(u8)(alphaSum/4);
 	}
 }
 

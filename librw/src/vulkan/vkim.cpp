@@ -103,6 +103,11 @@ setupCommonState(VkCommandBuffer commandBuffer, uint32 shader,
 	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
 	Raster *raster = (Raster*)GetRenderStatePtr(TEXTURERASTER);
+	// The masked-geometry mip bias belongs to the world pipe and is
+	// part of the sampler key; left at whatever the last atomic set,
+	// a particle with a mip chain would soften by however much the
+	// foliage before it asked for.
+	gstate.mipLodBias = 0;
 	VkDescriptorSet textureSet = getTextureDescriptor(raster);
 	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
 	                        getPipelineLayout(), 1, 1, &textureSet, 0, nil);

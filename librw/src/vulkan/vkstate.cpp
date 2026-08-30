@@ -68,6 +68,14 @@ struct StateFrame
 	VkBuffer sceneBuffer;
 	VkDeviceMemory sceneMemory;
 	void *sceneMapped;
+	// Interface coverage: the Im2D fragment shader marks the coarse screen
+	// cells it touched with atomics, and two frames later -- when this slot's
+	// fence has been waited and its image is the one the reflections sample
+	// -- the CPU reads the mask back and hands it to the world shader, so a
+	// help box never ends up mirrored in a car door.
+	VkBuffer coverageBuffer;
+	VkDeviceMemory coverageMemory;
+	uint32 *coverageMapped;
 
 	VkDescriptorSet boneDescriptor;
 	VkBuffer dynamicBuffer;
@@ -100,8 +108,11 @@ struct State
 	VkPipeline lastPipeline;
 	bool32 lastPipelineValid;
 
-	// Sampler cache, indexed by the packed sampler key.
-	VkSampler samplers[64];
+	// Sampler cache, indexed by the packed sampler key. Sized for the
+	// whole key: at 64 the two trilinear modes ran past the end and were
+	// folded back onto slot zero, so every world texture shared whichever
+	// sampler happened to be built first.
+	VkSampler samplers[512];
 
 	// 1x1 white texture bound for untextured materials, so no shader variant
 	// or descriptor gymnastics are needed for the untextured case.
@@ -109,6 +120,15 @@ struct State
 	VkDeviceMemory whiteMemory;
 	VkImageView whiteView;
 	VkDescriptorSet whiteDescriptor;
+	// The same white pixel as a one-layer array view: the reflection block's
+	// previous-frame binding is a sampler2DArray and a plain 2D view cannot
+	// legally stand in for it.
+	VkImageView whiteViewArray;
+
+	// Set 3: the vehicle env streak texture plus the previous frame's scene
+	// colour, rewritten and bound once per frame in beginFrame.
+	VkDescriptorSetLayout envLayout;
+	VkDescriptorSet envDescriptors[NUM_FRAME_CONTEXTS];
 
 	bool32 initialised;
 };
@@ -201,20 +221,21 @@ addressMode(uint32 rwAddress)
 	}
 }
 
-// filter (3 bits) | addressU (2) | addressV (2)
+// bias (2 bits) | filter (3) | addressU (2) | addressV (2)
 uint32
-makeSamplerKey(uint32 filter, uint32 addressU, uint32 addressV)
+makeSamplerKey(uint32 filter, uint32 addressU, uint32 addressV,
+               uint32 bias)
 {
 	const uint32 f = (filter - 1) & 0x7;
 	const uint32 u = (addressU - 1) & 0x3;
 	const uint32 v = (addressV - 1) & 0x3;
-	return (f << 4) | (u << 2) | v;
+	return ((bias & 0x3) << 7) | (f << 4) | (u << 2) | v;
 }
 
 VkSampler
 getSampler(uint32 key, uint32 filter, uint32 addressU, uint32 addressV)
 {
-	if(key >= 64)
+	if(key >= 512)
 		key = 0;
 	if(gs.samplers[key] != VK_NULL_HANDLE)
 		return gs.samplers[key];
@@ -227,6 +248,9 @@ getSampler(uint32 key, uint32 filter, uint32 addressU, uint32 addressV)
 	info.addressModeU = addressMode(addressU);
 	info.addressModeV = addressMode(addressV);
 	info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	// Half a level per step, taken from the key rather than the state so
+	// a cached sampler always matches the bias it was built for.
+	info.mipLodBias = (float32)((key >> 7) & 0x3)*0.5f;
 	// Every texture now carries a chain whether its TXD shipped one or
 	// not, so a material that asked for plain NEAREST or LINEAR has to be
 	// held at the base level. Without this the interface sheets, the fonts
@@ -358,6 +382,10 @@ createWhiteTexture(void)
 	viewInfo.subresourceRange.layerCount = 1;
 	if(vkCreateImageView(gvk.device, &viewInfo, nil, &gs.whiteView) != VK_SUCCESS)
 		return 0;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+	if(vkCreateImageView(gvk.device, &viewInfo, nil,
+	                     &gs.whiteViewArray) != VK_SUCCESS)
+		return 0;
 
 	VkDescriptorSetAllocateInfo setInfo = {};
 	setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -367,9 +395,16 @@ createWhiteTexture(void)
 	if(vkAllocateDescriptorSets(gvk.device, &setInfo, &gs.whiteDescriptor) != VK_SUCCESS)
 		return 0;
 
+	for(uint32 i = 0; i < NUM_FRAME_CONTEXTS; i++){
+		setInfo.pSetLayouts = &gs.envLayout;
+		if(vkAllocateDescriptorSets(gvk.device, &setInfo,
+		                            &gs.envDescriptors[i]) != VK_SUCCESS)
+			return 0;
+	}
+
 	VkDescriptorImageInfo imageDescriptor = {};
 	imageDescriptor.sampler = getSampler(makeSamplerKey(Texture::LINEAR,
-	                                                    Texture::WRAP, Texture::WRAP),
+	                                                    Texture::WRAP, Texture::WRAP, 0),
 	                                     Texture::LINEAR, Texture::WRAP, Texture::WRAP);
 	imageDescriptor.imageView = gs.whiteView;
 	imageDescriptor.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -396,16 +431,22 @@ stateInit(void)
 		return 1;
 	memset(&gs, 0, sizeof(gs));
 
-	VkDescriptorSetLayoutBinding sceneBinding = {};
-	sceneBinding.binding = 0;
-	sceneBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-	sceneBinding.descriptorCount = 1;
-	sceneBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+	VkDescriptorSetLayoutBinding sceneBindings[2] = {};
+	sceneBindings[0].binding = 0;
+	sceneBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	sceneBindings[0].descriptorCount = 1;
+	sceneBindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+	// The interface coverage mask the Im2D fragment shader writes with
+	// atomics; only rw_im2d.frag declares it.
+	sceneBindings[1].binding = 1;
+	sceneBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	sceneBindings[1].descriptorCount = 1;
+	sceneBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
 	VkDescriptorSetLayoutCreateInfo sceneLayoutInfo = {};
 	sceneLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	sceneLayoutInfo.bindingCount = 1;
-	sceneLayoutInfo.pBindings = &sceneBinding;
+	sceneLayoutInfo.bindingCount = 2;
+	sceneLayoutInfo.pBindings = sceneBindings;
 	if(vkCreateDescriptorSetLayout(gvk.device, &sceneLayoutInfo, nil,
 	                               &gs.sceneLayout) != VK_SUCCESS)
 		return 0;
@@ -440,10 +481,30 @@ stateInit(void)
 	                               &gs.boneLayout) != VK_SUCCESS)
 		return 0;
 
-	// Every pipeline declares all three sets so they can share one layout;
-	// only the skin pipeline actually binds set 2.
-	const VkDescriptorSetLayout layouts[3] = {
-		gs.sceneLayout, gs.textureLayout, gs.boneLayout
+	// Set 3: what the reflection block in rw_world.frag samples -- the
+	// vehicle env streak art and the previous frame's scene colour, written
+	// and bound once per frame in beginFrame.
+	VkDescriptorSetLayoutBinding envBindings[2] = {};
+	envBindings[0].binding = 0;
+	envBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	envBindings[0].descriptorCount = 1;
+	envBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	envBindings[1] = envBindings[0];
+	envBindings[1].binding = 1;
+
+	VkDescriptorSetLayoutCreateInfo envLayoutInfo = {};
+	envLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	envLayoutInfo.bindingCount = 2;
+	envLayoutInfo.pBindings = envBindings;
+	if(vkCreateDescriptorSetLayout(gvk.device, &envLayoutInfo, nil,
+	                               &gs.envLayout) != VK_SUCCESS)
+		return 0;
+
+	// Every pipeline declares all four sets so they can share one layout;
+	// only the skin pipeline actually binds set 2, and set 3 is only read by
+	// rw_world.frag's reflection block.
+	const VkDescriptorSetLayout layouts[4] = {
+		gs.sceneLayout, gs.textureLayout, gs.boneLayout, gs.envLayout
 	};
 	VkPushConstantRange pushRange = {};
 	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -451,7 +512,7 @@ stateInit(void)
 
 	VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
 	pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	pipelineLayoutInfo.setLayoutCount = 3;
+	pipelineLayoutInfo.setLayoutCount = 4;
 	pipelineLayoutInfo.pSetLayouts = layouts;
 	pipelineLayoutInfo.pushConstantRangeCount = 1;
 	pipelineLayoutInfo.pPushConstantRanges = &pushRange;
@@ -459,12 +520,16 @@ stateInit(void)
 	                          &gs.pipelineLayout) != VK_SUCCESS)
 		return 0;
 
-	VkDescriptorPoolSize poolSizes[3] = {};
+	VkDescriptorPoolSize poolSizes[4] = {};
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	poolSizes[0].descriptorCount = 4;
+	poolSizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	poolSizes[3].descriptorCount = NUM_FRAME_CONTEXTS;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	// +1 white, +2 per frame context for the env/reflection set.
 	poolSizes[1].descriptorCount =
-		MAX_TEXTURE_DESCRIPTORS*NUM_FRAME_CONTEXTS + 1;
+		MAX_TEXTURE_DESCRIPTORS*NUM_FRAME_CONTEXTS + 1 +
+		2*NUM_FRAME_CONTEXTS;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
 	poolSizes[2].descriptorCount = NUM_FRAME_CONTEXTS;
 
@@ -475,7 +540,7 @@ stateInit(void)
 	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
 	poolInfo.maxSets =
 		MAX_TEXTURE_DESCRIPTORS*NUM_FRAME_CONTEXTS + 16;
-	poolInfo.poolSizeCount = 3;
+	poolInfo.poolSizeCount = 4;
 	poolInfo.pPoolSizes = poolSizes;
 	if(vkCreateDescriptorPool(gvk.device, &poolInfo, nil, &gs.descriptorPool) != VK_SUCCESS)
 		return 0;
@@ -503,16 +568,34 @@ stateInit(void)
 		                            &sf.sceneDescriptor) != VK_SUCCESS)
 			return 0;
 
+		if(!createBuffer(16*sizeof(uint32),
+		                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                 &sf.coverageBuffer, &sf.coverageMemory))
+			return 0;
+		if(vkMapMemory(gvk.device, sf.coverageMemory, 0,
+		               16*sizeof(uint32), 0,
+		               (void**)&sf.coverageMapped) != VK_SUCCESS)
+			return 0;
+		memset(sf.coverageMapped, 0, 16*sizeof(uint32));
+
 		VkDescriptorBufferInfo sceneBufferInfo =
 			{ sf.sceneBuffer, 0, sizeof(SceneData) };
-		VkWriteDescriptorSet sceneWrite = {};
-		sceneWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		sceneWrite.dstSet = sf.sceneDescriptor;
-		sceneWrite.dstBinding = 0;
-		sceneWrite.descriptorCount = 1;
-		sceneWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-		sceneWrite.pBufferInfo = &sceneBufferInfo;
-		vkUpdateDescriptorSets(gvk.device, 1, &sceneWrite, 0, nil);
+		VkDescriptorBufferInfo coverageBufferInfo =
+			{ sf.coverageBuffer, 0, 16*sizeof(uint32) };
+		VkWriteDescriptorSet sceneWrites[2] = {};
+		sceneWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		sceneWrites[0].dstSet = sf.sceneDescriptor;
+		sceneWrites[0].dstBinding = 0;
+		sceneWrites[0].descriptorCount = 1;
+		sceneWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		sceneWrites[0].pBufferInfo = &sceneBufferInfo;
+		sceneWrites[1] = sceneWrites[0];
+		sceneWrites[1].dstBinding = 1;
+		sceneWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		sceneWrites[1].pBufferInfo = &coverageBufferInfo;
+		vkUpdateDescriptorSets(gvk.device, 2, sceneWrites, 0, nil);
 	}
 
 	gs.modules[SHADER_WORLD][0] = createModule(kWorldVertSpv, sizeof(kWorldVertSpv));
@@ -762,6 +845,23 @@ uploadSceneData(void)
 	StateFrame &sf = gs.frames[gs.activeFrame];
 	if(sf.sceneMapped != nil)
 		memcpy(sf.sceneMapped, &gs.scene, sizeof(SceneData));
+}
+
+// The interface coverage this slot's frame accumulated -- its fence has just
+// been waited, so the GPU atomics have landed -- then zeroed for reuse. Two
+// frame contexts mean the mask describes the frame BEFORE the image the
+// reflections sample; the interface holds still between adjacent frames, so
+// the one-frame skew never shows.
+void
+readAndResetCoverage(uint32 out[16])
+{
+	StateFrame &sf = gs.frames[gs.activeFrame];
+	if(sf.coverageMapped == nil){
+		memset(out, 0, 16*sizeof(uint32));
+		return;
+	}
+	memcpy(out, sf.coverageMapped, 16*sizeof(uint32));
+	memset(sf.coverageMapped, 0, 16*sizeof(uint32));
 }
 
 VkPipeline
@@ -1081,7 +1181,8 @@ getTextureDescriptor(Raster *raster)
 
 	const uint32 key = makeSamplerKey(gstate.textureFilter,
 	                                  gstate.textureAddressU,
-	                                  gstate.textureAddressV);
+	                                  gstate.textureAddressV,
+	                                  gstate.mipLodBias);
 	const uint32 frame = gs.activeFrame;
 	if(native->descriptorSet[frame] != VK_NULL_HANDLE &&
 	   native->samplerKey[frame] == key)
@@ -1121,6 +1222,58 @@ getTextureDescriptor(Raster *raster)
 
 	native->samplerKey[frame] = key;
 	return native->descriptorSet[frame];
+}
+
+// Set 3 for the frame: the vehicle env streak texture (white until a vehicle
+// with one has drawn) and the previous frame's scene colour (a white array
+// pixel before the first frame exists). Rewriting is safe here because the
+// slot's fence was waited in beginFrame before this runs.
+void
+bindEnvironmentDescriptor(VkCommandBuffer commandBuffer,
+                          VkImageView previousScene)
+{
+	const VkDescriptorSet set = gs.envDescriptors[gs.activeFrame];
+	if(set == VK_NULL_HANDLE)
+		return;
+
+	VkImageView streakView = gs.whiteView;
+	if(gvk.envRaster != nil){
+		VulkanRaster *native = PLUGINOFFSET(VulkanRaster, gvk.envRaster,
+		                                    nativeRasterOffset);
+		if(native->view != VK_NULL_HANDLE)
+			streakView = native->view;
+	}
+
+	VkDescriptorImageInfo images[2] = {};
+	images[0].sampler = getSampler(makeSamplerKey(Texture::LINEAR,
+	                                              Texture::WRAP,
+	                                              Texture::WRAP, 0),
+	                               Texture::LINEAR,
+	                               Texture::WRAP, Texture::WRAP);
+	images[0].imageView = streakView;
+	images[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	images[1].sampler = getSampler(makeSamplerKey(Texture::LINEAR,
+	                                              Texture::CLAMP,
+	                                              Texture::CLAMP, 0),
+	                               Texture::LINEAR,
+	                               Texture::CLAMP, Texture::CLAMP);
+	images[1].imageView = previousScene != VK_NULL_HANDLE ?
+		previousScene : gs.whiteViewArray;
+	images[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	VkWriteDescriptorSet writes[2] = {};
+	for(uint32 i = 0; i < 2; i++){
+		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i].dstSet = set;
+		writes[i].dstBinding = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType =
+			VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[i].pImageInfo = &images[i];
+	}
+	vkUpdateDescriptorSets(gvk.device, 2, writes, 0, nil);
+	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+	                        gs.pipelineLayout, 3, 1, &set, 0, nil);
 }
 
 bool32

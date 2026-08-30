@@ -57,7 +57,7 @@ autoResetRenderScaleAfterGameInitialiseFailure(void)
 	}
 
 	const int persistedScale = (int)GetPrivateProfileIntA(
-		"VR", "RenderScalePercent", 125, settingsPath);
+		"VR", "RenderScalePercent", 100, settingsPath);
 	if(persistedScale <= 100)
 		return;
 
@@ -375,6 +375,10 @@ renderGameFrame(VkImage image, VkImageView view, const float viewProj[2][16],
 	// Game time follows the display clock, not the wall clock; see
 	// getPredictedDisplayTimeNs.
 	androidgame::SetFrameTimeNs(xrvk::getPredictedDisplayTimeNs());
+	// The previous Step's completed light list, before beginFrame writes the
+	// scene block. This Step's own lights land a frame later, which no light
+	// pool is sharp enough to show.
+	androidgame::VrPushDynamicLights();
 	platform::setCheckpoint("vk/beginFrame");
 	androidgame::QuestProfilerBeginVkBegin();
 	const int64_t beginStartNs = monotonicNowNs();
@@ -431,6 +435,8 @@ renderGameFrame(VkImage image, VkImageView view, const float viewProj[2][16],
 	rw::vulkan::setGenerateMipmaps(androidgame::VrGenerateMipmaps());
 	rw::vulkan::setPs2AlphaTestEnabled(androidgame::VrPs2AlphaTest());
 	rw::vulkan::setRenderDiagnostics(androidgame::VrRenderDiagnostics());
+	rw::vulkan::setMaskedMipBias(
+		(rw::uint32)androidgame::VrFoliageSoftness());
 	static uint32 lastColourMode = ~0u;
 	if(colourMode != lastColourMode){
 		__android_log_print(ANDROID_LOG_INFO, "MiamiVR",

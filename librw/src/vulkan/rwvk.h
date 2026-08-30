@@ -34,6 +34,11 @@ struct EngineOpenParams
 	// Requested scene raster sample count. The backend validates it against
 	// colour and depth limits and falls back to one sample if unsupported.
 	uint32 sceneSampleCount;
+	// How far the finished frame is reduced before the vehicle reflection
+	// samples it: 2, 4 or 8. One reads the full image, which is what the
+	// reflection did before the reduced copy existed. Anything else
+	// falls back to 4.
+	uint32 sceneReflectionDivisor;
 	uint32 viewCount;
 	VkFormat colourFormat;
 };
@@ -49,6 +54,7 @@ Raster *rasterCreate(Raster *raster);
 uint8 *rasterLock(Raster *raster, int32 level, int32 lockMode);
 void rasterUnlock(Raster *raster, int32 level);
 int32 rasterNumLevels(Raster *raster);
+bool32 rasterHasGeneratedMips(Raster *raster);
 bool32 imageFindRasterFormat(Image *image, int32 type,
                              int32 *width, int32 *height,
                              int32 *depth, int32 *format);
@@ -398,11 +404,62 @@ void setGenerateMipmaps(bool32 enabled);
 // geometry writes depth for colour it never draws.
 void setPs2AlphaTestEnabled(bool32 enabled);
 bool32 getPs2AlphaTestEnabled(void);
+// The game's dynamic light list for this frame, world space, applied per
+// pixel by the world, skin and vehicle pipelines. The fixed-function original
+// only ever bent these into extra directionals for peds and vehicles; the
+// backend keeps the same falloff and cone rules but lets the world receive
+// them too. Push zero lights to switch the effect off; anything past
+// MAX_POINT_LIGHTS is dropped, so hand over the nearest ones first.
+// glowStrength additionally draws each light as a soft cloud where the view
+// ray passes near it, so a source reads in the air and not only as a pool on
+// surfaces; zero disables the term, 0.14 is the tuned baseline.
+enum { MAX_POINT_LIGHTS = 8 };
+struct PointLight
+{
+	float32 position[3];
+	float32 radius;
+	float32 colour[3];
+	// A cone along direction, opened the way CPointLights' directional
+	// lights are; direction is ignored for omni lights.
+	bool32 spot;
+	float32 direction[3];
+};
+void setPointLights(const PointLight *lights, uint32 count,
+                    float32 glowStrength);
+// Reflections on materials that carry a MatFX env map -- vehicle
+// bodywork and chrome. The previous frame is reprojected onto the body,
+// over a panorama of the streak art the DFF references where that
+// lookup has no answer. The original drew these with a second textured
+// pass this backend never implemented, so without it they have none.
+void setCarReflectionsEnabled(bool32 enabled);
+// How strong the reflection layer reads. intensity scales the whole env
+// addition -- 1.0 is the tuned baseline, lower takes the glassy sheen off
+// the paint. ssrStrength scales only the previous-frame lookup's weight
+// within it: 1.0 is the baseline, 0 removes the live surroundings entirely
+// and leaves every car on the panorama, the way the original's env pass
+// behaved. ssrDistance keeps that live part within so many metres of the
+// eye, fading to the panorama past it; pass something huge for no limit.
+void setCarReflectionParams(float32 intensity, float32 ssrStrength,
+                            float32 ssrDistance);
+// The vehicle the player currently occupies, world space, with its model
+// bounding radius. Its atomics keep the panorama reflection layer only:
+// from the driver's seat a screen-space lookup mostly finds the car itself,
+// and the cockpit magnifies every artefact of it. The radius matters -- a
+// fixed reach missed the bumper and door atomics of long vehicles, whose
+// centres sit further out, and those parts kept flashing live reflections.
+// Pass active = 0 on foot.
+void setPlayerVehicle(const float32 position[3], float32 radius,
+                      bool32 active);
 // One line saying how many textures got a chain and what turned the rest
 // away. Silent unless diagnostics are switched on: a player's logcat is
 // not the place for it.
 void reportGeneratedMips(void);
 void setRenderDiagnostics(bool32 enabled);
+// How far down the mip chain masked geometry is pushed, in half
+// levels. Foliage sparkles because its mask is finer than a pixel;
+// this trades that detail for stillness.
+void setMaskedMipBias(uint32 halfLevels);
+uint32 getMaskedMipBias(void);
 bool32 renderDiagnosticsEnabled(void);
 // Uploads whatever the mip worker has finished. Call once per frame
 // from the thread that owns the command buffer.
@@ -445,7 +502,8 @@ uint32 getSceneSampleCount(void);
 // when the device lacks BC support or the type is not DXT1/3/5; the caller
 // falls back to software decoding.
 Raster *rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
-                      const uint8 *blocks, uint32 size);
+                      const uint8 *blocks, uint32 size,
+                      const uint32 *levelSizes, int32 txdLevels);
 
 // Immediate mode, implemented in vkim.cpp and wired into the device table.
 void im2DRenderLine(void *vertices, int32 numVertices, int32 vert1, int32 vert2);

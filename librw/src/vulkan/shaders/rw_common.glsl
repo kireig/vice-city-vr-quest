@@ -25,10 +25,18 @@ layout(set = 0, binding = 0) uniform SceneData {
 	// x = start, y = end, z = 1/(end-start), w = enabled
 	vec4 fogParams;
 	vec4 ambient;
-	// xyz = direction (pointing from the surface toward the light), w = unused
-	vec4 lightDirection[RW_MAX_LIGHTS];
+	// The game's dynamic lights -- headlights, explosions, street lamps --
+	// already moved to play space on the CPU. RenderWare's fixed function only
+	// ever fed these to peds and vehicles as extra directionals; here the
+	// fragment stage applies them to everything, so a headlight lands on the
+	// road it is pointed at.
+	// xyz = position, w = radius
+	vec4 lightPosRad[RW_MAX_LIGHTS];
 	vec4 lightColour[RW_MAX_LIGHTS];
-	// x = active directional light count
+	// xyz = cone axis, w > 0.5 marks a cone (car headlights)
+	vec4 lightDir[RW_MAX_LIGHTS];
+	// x = active dynamic light count, y = air glow strength (0 disables),
+	// zw = scene pixel size for gl_FragCoord-based lookups
 	vec4 lightCount;
 	// Places the screen-space Im2D plane in the world, in front of the head.
 	// Both eyes then project it through their own matrix, which is what makes
@@ -39,13 +47,35 @@ layout(set = 0, binding = 0) uniform SceneData {
 	// Together they turn a screen vertex plus its own camera depth back into
 	// a world point; see rw_im2d.vert.
 	vec4 im2dParams;
+	// The timecycle sky top the render pass clears to; the vehicle env
+	// reflection mixes toward it away from the horizon's fog colour.
+	vec4 skyColour;
+	// Current play space to the previous frame's clip, per eye, with the
+	// camera-fold delta between the frames already composed in. Projecting
+	// through previousViewProj alone leaves out that delta, and the
+	// reflection then swims by one frame of camera motion and snaps back.
+	mat4 reflectionReproject[2];
+	// 16x16 screen cells per eye that interface (Im2D) draws touched in the
+	// frame the reflections sample: words 0-7 left eye, 8-15 right eye. A
+	// help box is head-locked, so its ghost would otherwise slide across a
+	// car body with every head turn.
+	uvec4 im2dCoverage[4];
+	// x = overall reflection intensity, y = SSR weight inside it, z = how
+	// far from the eye the SSR part reaches in metres before fading to the
+	// panorama. All player-tuned; 1.0 / 1.0 / huge is the baseline.
+	vec4 reflectionParams;
 } scene;
 
 layout(push_constant) uniform PushConstants {
 	mat4 model;
 	// Material colour modulated with the vertex colour.
 	vec4 materialColour;
-	// x = ambient, y = diffuse, z = unused, w = alpha test reference
+	// x = ambient, y = diffuse, z = the draw's dynamic-light state packed as
+	// an exact integer -- bits 0-7 surface light mask, 8-15 glow mask, 16
+	// real normals, 17-22 the MatFX env coefficient for the reflection,
+	// 23 the player's own vehicle, which keeps the panorama layer only
+	// (Im2D reuses the slot for its strict-depth select) -- w = alpha test
+	// reference
 	vec4 surfaceProps;
 	// rgb = world ambient, zero for geometry lit purely by prelight.
 	vec4 ambientLight;

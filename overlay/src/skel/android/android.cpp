@@ -948,7 +948,23 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 					bike->GetForward()*seatLocal.y+
 					bike->GetUp()*seatLocal.z;
 		}
-		head += forward * 0.12f;
+		CVector nudge = forward;
+		if(headModeOnFoot){
+			// In the head modes TheCamera follows the CHARACTER: a backward
+			// walk turns the ped to face the player, the chase logic swings
+			// after it, and for a moment this forward points somewhere the
+			// player is not looking. The 0.12m eye nudge rode that swing,
+			// felt as being pulled a small step forward after every
+			// backward walk. The headset's own view basis cannot be turned
+			// by gameplay, so the nudge follows it instead; the anchor
+			// heading stays on the camera value the movement code is
+			// calibrated against.
+			float vrForward[3];
+			if(androidgame::VrGetViewBasis(nil, nil, nil, vrForward))
+				nudge = CVector(vrForward[0], vrForward[1],
+					vrForward[2]);
+		}
+		head += nudge * 0.12f;
 		if(thirdPersonVehicle){
 			// Ride the stock chase camera instead of a seat: its position
 			// and heading, but through the first-person machinery, so the
@@ -1434,8 +1450,10 @@ Initialise(const VulkanContext &context, bool *renderTargetStartupFailure)
 	// Temporal reconstruction is currently disabled on Quest: headset tests
 	// showed per-eye micro-motion even when the image was otherwise stationary.
 	// Keep the implementation for research, but never expose an unsafe startup
-	// mode. Headset validation also found no visible gain from 2x/4x MSAA, so
-	// the public path stays at the exact stable single-sample fallback.
+	// mode. Multisampling is available again and does what it always
+	// did: geometry edges. It never touched the masks, and the attempt
+	// to make it do so through alpha to coverage only dithered them.
+	// What settled the foliage was giving it a mip chain to sample.
 	const int requestedMsaa = GetPrivateProfileIntA("VR", "MsaaSamples", 1,
 	                                               ".\\vr_settings.ini");
 	if(requestedTemporalMode != rw::vulkan::SGSR_OFF){
@@ -1444,21 +1462,30 @@ Initialise(const VulkanContext &context, bool *renderTargetStartupFailure)
 		ALOG("disabled unstable temporal mode %d",
 		     requestedTemporalMode);
 	}
-	if(requestedMsaa != 1){
-		WritePrivateProfileStringA("VR", "MsaaSamples", "1",
-		                           ".\\vr_settings.ini");
-		ALOG("disabled ineffective MSAA request %d; using stable 1x",
-		     requestedMsaa);
+	const int msaaSamples = requestedMsaa >= 4 ? 4 :
+		requestedMsaa >= 2 ? 2 : 1;
+	if(msaaSamples != requestedMsaa){
+		char text[8];
+		snprintf(text, sizeof(text), "%d", msaaSamples);
+		WritePrivateProfileStringA("VR", "MsaaSamples", text,
+			".\\vr_settings.ini");
 	}
 	backendParams.sgsrMode = rw::vulkan::SGSR_OFF;
-	backendParams.sceneSampleCount = 1;
+	backendParams.sceneSampleCount = msaaSamples;
+	// The reflection reads a reduced copy of the previous frame; how far
+	// reduced is the player-s, because the right answer depends on the
+	// render scale it is paired with. One reads the frame itself.
+	backendParams.sceneReflectionDivisor =
+		GetPrivateProfileIntA("VR", "CarReflectionScale", 4,
+			".\\vr_settings.ini");
 	backendParams.sceneWidth = context.width;
 	backendParams.sceneHeight = context.height;
 	backendParams.viewCount = context.viewCount;
 	backendParams.colourFormat = context.colourFormat;
-	ALOG("stable native scene=%ux%u output=%ux%u temporal=off msaa=1x",
+	ALOG("stable native scene=%ux%u output=%ux%u temporal=off "
+	     "msaa=%dx",
 	     backendParams.sceneWidth, backendParams.sceneHeight,
-	     context.width, context.height);
+	     context.width, context.height, msaaSamples);
 
 	if(RsEventHandler(rsRWINITIALIZE, &backendParams) == rsEVENTERROR){
 		if(renderTargetStartupFailure != nil)

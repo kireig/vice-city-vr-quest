@@ -98,12 +98,13 @@ reportGeneratedMips(void)
 {
 	if(!renderDiagnosticsEnabled())
 		return;
-	VKLOG("mips: seen %u made %u promoted %u in %llu ms | rejected "
-	      "flag %u type %u size %u large %u format %u | landed %u",
-	      gMipSeen, gMipMade, gMipPromoted,
+	VKLOG("mips: seen %u made %u in %llu ms | rejected "
+	      "flag %u type %u size %u large %u format %u | landed %u "
+	      "promoted %u",
+	      gMipSeen, gMipMade,
 	      (unsigned long long)(gMipMicroseconds/1000ull),
 	      gMipOffFlag, gMipNotTexture, gMipTooSmall, gMipTooLarge,
-	      gMipBadFormat, gMipLanded);
+	      gMipBadFormat, gMipLanded, gMipPromoted);
 }
 
 static bool32
@@ -376,6 +377,11 @@ createNativeRaster(void *object, int32 offset, int32)
 static void*
 destroyNativeRaster(void *object, int32 offset, int32)
 {
+	// The env-map raster the reflection block samples can be streamed out
+	// with its vehicle; beginFrame falls back to white until the next one
+	// registers.
+	if(gvk.envRaster == (Raster*)object)
+		gvk.envRaster = nil;
 	// A texture can be evicted while its chain is still being built.
 	cancelGeneratedMips(PLUGINOFFSET(VulkanRaster, object, offset));
 	VulkanRaster *native = PLUGINOFFSET(VulkanRaster, object, offset);
@@ -667,6 +673,9 @@ encodeColourBlock(const uint8 *rgba, bool32 skipClear,
 		}
 	}
 	if(!anyOpaque){
+		// Every texel was cut. Only the punch-through path can reach
+		// this, and there all sixteen indices are the transparent one,
+		// so the endpoints only have to be defined.
 		lo[0] = lo[1] = lo[2] = 0;
 		hi[0] = hi[1] = hi[2] = 0;
 	}
@@ -754,7 +763,11 @@ encodeBcBlock(const uint8 *rgba, VkFormat format, uint8 *block)
 		encodeColourBlock(rgba, 1, 1, block);
 		return;
 	}
-	encodeColourBlock(rgba, 1, 0, block+8);
+	// Every texel goes into the fit here. Skipping the clear ones
+	// sounds right and is not: a minified leaf mask is mostly clear,
+	// so whole blocks end up with nothing to fit and collapse -- a
+	// grid of dark squares across the foliage.
+	encodeColourBlock(rgba, 0, 0, block+8);
 	if(format == VK_FORMAT_BC2_UNORM_BLOCK){
 		for(int i = 0; i < 8; i++)
 			block[i] = (uint8)((((rgba[(i*2+1)*4+3]+8)/17) << 4) |
@@ -1315,9 +1328,14 @@ stopGeneratedMips(void)
 // desktop D3D12 build uploads it. Decoding on the CPU instead cost
 // milliseconds per streamed texture, which surfaced as frame drops -- the
 // world lurching -- whenever driving streamed new map sectors in.
+//
+// levelSizes holds one entry per level the TXD carried, and blocks holds
+// them back to back. Such a chain is used as it stands when this backend
+// is not building one of its own -- see the note where that is decided.
 Raster *
 rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
-              const uint8 *blocks, uint32 size)
+              const uint8 *blocks, uint32 size,
+              const uint32 *levelSizes, int32 txdLevels)
 {
 	if(!gvk.supportsBC || blocks == nil || size == 0)
 		return nil;
@@ -1343,17 +1361,31 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 		return nil;
 	VulkanRaster *native = GETVULKANRASTER(raster);
 	native->format = format;
+	// A chain out of the dictionary is only taken when this backend
+	// is not building one. The model packs were filtered without
+	// weighting the colour by alpha, so their levels carry a dark rim
+	// around every shape in a mask -- a lattice across foliage and
+	// neon once anything samples them. Ours are weighted, so with
+	// generation on, ours wins.
+	const bool32 generate = wantsGeneratedMips(raster, format);
+	const bool32 txdChain = levelSizes != nil && txdLevels > 1 && !generate;
 	native->numLevels = 1;
-	native->generateMips = wantsGeneratedMips(raster, format);
-	if(native->generateMips){
-		uint32 extent = (uint32)(width > height ? width : height);
-		while(extent > 1){
-			extent >>= 1;
-			native->numLevels++;
+	native->generateMips = 0;
+	if(txdChain){
+		native->numLevels = txdLevels;
+	}else{
+		native->generateMips = generate;
+		if(native->generateMips){
+			uint32 extent = (uint32)(width > height ? width : height);
+			while(extent > 1){
+				extent >>= 1;
+				native->numLevels++;
+			}
 		}
 	}
 	const bool32 blockAlpha =
-		dxt == 1 && dxt1BlocksHaveTransparency(blocks, size);
+		dxt == 1 && dxt1BlocksHaveTransparency(blocks,
+			levelSizes != nil ? levelSizes[0] : size);
 	native->hasAlpha = hasAlpha || blockAlpha;
 
 	// A cut-out BC1 texture is re-packed as BC3 on the way up, so the
@@ -1363,7 +1395,8 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	// either way. The blocks the worker filters stay the originals.
 	const VkFormat sourceFormat = format;
 	const uint32 sourceSize = size;
-	const bool32 promote = native->generateMips && blockAlpha &&
+	const bool32 promote = native->generateMips && !txdChain &&
+		blockAlpha &&
 		format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
 	if(promote){
 		format = VK_FORMAT_BC3_UNORM_BLOCK;
@@ -1425,8 +1458,11 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
 	viewInfo.format = format;
 	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	// Level 0 is all that exists until the worker comes back.
-	viewInfo.subresourceRange.levelCount = 1;
+	// A generated chain is not there yet, so the view starts at level 0
+	// and is replaced once the worker lands it. One that came out of the
+	// dictionary is uploaded below and can be exposed at once.
+	viewInfo.subresourceRange.levelCount =
+		txdChain ? (uint32)native->numLevels : 1;
 	viewInfo.subresourceRange.layerCount = 1;
 	if(vkCreateImageView(gvk.device, &viewInfo, nil, &native->view) != VK_SUCCESS){
 		raster->destroy();
@@ -1460,14 +1496,23 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 		                      (uint32)native->numLevels,
 		                      VK_IMAGE_LAYOUT_UNDEFINED,
 		                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-		VkBufferImageCopy region = {};
-		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		region.imageSubresource.layerCount = 1;
-		region.imageExtent.width = (uint32)width;
-		region.imageExtent.height = (uint32)height;
-		region.imageExtent.depth = 1;
-		vkCmdCopyBufferToImage(commandBuffer, staging, native->image,
-			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		VkDeviceSize levelOffset = 0;
+		for(int32 level = 0; level < (txdChain ? txdLevels : 1); level++){
+			VkBufferImageCopy region = {};
+			region.bufferOffset = levelOffset;
+			region.imageSubresource.aspectMask =
+				VK_IMAGE_ASPECT_COLOR_BIT;
+			region.imageSubresource.mipLevel = (uint32)level;
+			region.imageSubresource.layerCount = 1;
+			region.imageExtent.width =
+				levelDimension((uint32)width, level);
+			region.imageExtent.height =
+				levelDimension((uint32)height, level);
+			region.imageExtent.depth = 1;
+			vkCmdCopyBufferToImage(commandBuffer, staging, native->image,
+				VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+			levelOffset += levelSizes != nil ? levelSizes[level] : size;
+		}
 		transitionImageLayout(commandBuffer, native->image,
 		                      VK_IMAGE_ASPECT_COLOR_BIT,
 		                      (uint32)native->numLevels,
@@ -1480,10 +1525,10 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 	// retires this staging allocation after both the copy and its consumers.
 	retireBuffer(staging, stagingMemory);
 
-	if(native->numLevels > 1)
+	if(native->generateMips && native->numLevels > 1)
 		queueGeneratedMips(native, sourceFormat, format,
 			(uint32)width, (uint32)height, native->numLevels,
-			blocks, sourceSize);
+			blocks, levelSizes != nil ? levelSizes[0] : sourceSize);
 
 	return raster;
 }
@@ -1654,6 +1699,15 @@ rasterNumLevels(Raster *raster)
 {
 	VulkanRaster *native = GETVULKANRASTER(raster);
 	return native->numLevels > 0 ? native->numLevels : 1;
+}
+
+// Whether this backend built the chain rather than taking it from the
+// dictionary. Only the ones built here are filtered with the colour
+// weighted by alpha.
+bool32
+rasterHasGeneratedMips(Raster *raster)
+{
+	return GETVULKANRASTER(raster)->generateMips;
 }
 
 bool32

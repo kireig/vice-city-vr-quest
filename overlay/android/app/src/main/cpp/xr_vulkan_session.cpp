@@ -1160,7 +1160,7 @@ createSwapchain(void)
 	if(baselineVersion < 1){
 		struct BaselineSetting { const char *key; const char *value; };
 		static const BaselineSetting settings[] = {
-			{ "RenderScalePercent", "125" },
+			{ "RenderScalePercent", "100" },
 			{ "Sgsr2Mode", "0" },
 			{ "CpuPerformanceMode", "1" },
 			{ "GpuPerformanceMode", "1" },
@@ -1186,8 +1186,21 @@ createSwapchain(void)
 		LOGI("Quest baseline profile migration: version=%d result=%s path=%s",
 		     baselineVersion, migrated ? "applied" : "FAILED", settingsPath);
 	}
+	// 0.5.4 moves the baseline down to native resolution. The old 125%
+	// left nothing for the effects added since, and a settings file
+	// written by an earlier build still carries it. Only the scale is
+	// rewritten; the rest of the page stays as the player set it.
+	if(baselineVersion < 2){
+		const bool rescaled =
+			WritePrivateProfileStringA("VR", "RenderScalePercent",
+				"100", settingsPath) &&
+			WritePrivateProfileStringA("VR",
+				"QuestBaselineProfileVersion", "2", settingsPath);
+		LOGI("Quest render scale baseline reset to 100%%: result=%s",
+		     rescaled ? "applied" : "FAILED");
+	}
 	int renderScalePercent = (int)GetPrivateProfileIntA(
-		"VR", "RenderScalePercent", 125, settingsPath);
+		"VR", "RenderScalePercent", 100, settingsPath);
 	if(renderScalePercent < 100)
 		renderScalePercent = 100;
 	else if(renderScalePercent > 175)

@@ -16,6 +16,11 @@ layout(location = 0) out vec4 fragColour;
 layout(location = 1) out vec2 fragTexCoord;
 layout(location = 2) out float fragFog;
 layout(location = 3) flat out vec2 fragDynamicMotion;
+// Present only because this stage shares rw_world.frag with the atomic
+// pipelines. Immediate geometry pushes a zero diffuse coefficient, which is
+// what makes the fragment stage skip the dynamic lights entirely.
+layout(location = 4) out vec3 fragWorldPos;
+layout(location = 5) out vec3 fragNormal;
 
 void main()
 {
@@ -26,6 +31,8 @@ void main()
 	fragDynamicMotion = gl_ViewIndex == 0 ? rootMotion.xy : rootMotion.zw;
 	fragColour = inColour * push.materialColour;
 	fragTexCoord = inTexCoord;
+	fragWorldPos = world.xyz;
+	fragNormal = vec3(0.0, 0.0, 1.0);
 	// Fog by distance from the eye rather than by depth along the view axis.
 	// Planar depth makes the fog a wall perpendicular to the gaze, and in a
 	// headset that wall turns with the head: the mist appears to follow the

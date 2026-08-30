@@ -563,7 +563,12 @@ readAsImageAnyFormat(Stream *stream, int32 width, int32 height, int32 depth,
 	img->allocate();
 
 	Raster *ras = nil;
+	// Set once the compressed path below has taken every level out of
+	// the stream, so the loop does not go looking for another one.
+	bool32 chainConsumed = 0;
 	for(int32 i = 0; i < numLevels; i++){
+		if(chainConsumed)
+			break;
 		uint32 size = stream->readU32();
 		// The base level is all that is needed; anything the target platform
 		// wants beyond it is its own business.
@@ -572,16 +577,57 @@ readAsImageAnyFormat(Stream *stream, int32 width, int32 height, int32 depth,
 			continue;
 		}
 
-		uint8 *data = rwNewT(uint8, size, MEMDUR_FUNCTION | ID_IMAGE);
+		// Room for the whole chain when the dictionary brought one. The
+		// levels sit back to back in the stream and go to the GPU the
+		// same way, so one buffer holds all of them.
+		enum { MAX_TXD_LEVELS = 16 };
+		uint32 levelSizes[MAX_TXD_LEVELS];
+		int32 chainLevels = 1;
+		uint32 capacity = size;
+#ifdef RW_VULKAN
+		if(compression != 0 && numLevels > 1){
+			const uint32 blockBytes = compression == 1 ? 8 : 16;
+			int32 levelWidth = width, levelHeight = height;
+			chainLevels = numLevels < MAX_TXD_LEVELS ?
+				numLevels : MAX_TXD_LEVELS;
+			capacity = 0;
+			for(int32 l = 0; l < chainLevels; l++){
+				capacity += (uint32)(((levelWidth+3)/4)*
+					((levelHeight+3)/4))*blockBytes;
+				levelWidth = levelWidth > 1 ? levelWidth/2 : 1;
+				levelHeight = levelHeight > 1 ? levelHeight/2 : 1;
+			}
+			if(capacity < size)
+				capacity = size;
+		}
+#endif
+		uint8 *data = rwNewT(uint8, capacity, MEMDUR_FUNCTION | ID_IMAGE);
 		stream->read8(data, size);
+		levelSizes[0] = size;
 
 #ifdef RW_VULKAN
 		// BC-capable device: hand the DXT blocks to the GPU as-is, exactly
 		// like the desktop D3D12 build. The CPU decode below is the fallback
 		// and costs enough per texture to drop frames while streaming.
 		if(compression != 0){
+			uint32 used = size;
+			for(int32 l = 1; l < numLevels; l++){
+				const uint32 levelSize = stream->readU32();
+				if(l >= chainLevels || used+levelSize > capacity){
+					// Whatever is left stays on the floor, and the chain
+					// ends where it stopped being contiguous.
+					if(l < chainLevels)
+						chainLevels = l;
+					stream->seek(levelSize);
+					continue;
+				}
+				stream->read8(data+used, levelSize);
+				levelSizes[l] = levelSize;
+				used += levelSize;
+			}
+			chainConsumed = 1;
 			ras = rw::vulkan::rasterFromDXT(width, height, compression,
-				hasAlpha, data, size);
+				hasAlpha, data, used, levelSizes, chainLevels);
 			if(ras != nil){
 				rwFree(data);
 				continue;

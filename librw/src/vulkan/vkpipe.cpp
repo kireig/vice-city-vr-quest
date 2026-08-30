@@ -12,6 +12,8 @@
 #include "../rwpipeline.h"
 #include "../rwobjects.h"
 #include "../rwengine.h"
+#include "../rwanim.h"
+#include "../rwplugins.h"
 #include "rwvk.h"
 #include "rwvkimpl.h"
 
@@ -406,6 +408,24 @@ defaultUninstanceCB(Geometry *, InstanceDataHeader *)
 	assert(0 && "can't uninstance");
 }
 
+// Squared distance from a point to the segment ab; the per-draw glow test
+// asks how close a light sits to the line of sight toward an atomic.
+static float32
+pointSegmentDistSq(const float32 point[3], const float32 a[3],
+                   const float32 b[3])
+{
+	const float32 abx = b[0]-a[0], aby = b[1]-a[1], abz = b[2]-a[2];
+	const float32 apx = point[0]-a[0], apy = point[1]-a[1],
+	              apz = point[2]-a[2];
+	const float32 abLenSq = abx*abx + aby*aby + abz*abz;
+	float32 t = abLenSq > 0.0f ?
+		(apx*abx + apy*aby + apz*abz)/abLenSq : 0.0f;
+	if(t < 0.0f) t = 0.0f;
+	if(t > 1.0f) t = 1.0f;
+	const float32 dx = apx - abx*t, dy = apy - aby*t, dz = apz - abz*t;
+	return dx*dx + dy*dy + dz*dz;
+}
+
 // Shared by the default and skin pipelines: same material walk, same state,
 // only the shader variant and the extra bone descriptor differ. boneOffset is
 // nil for unskinned geometry.
@@ -491,6 +511,51 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 		}
 	}
 
+	// Which of the frame's dynamic lights are worth this atomic's pixels,
+	// decided once per draw so the fragment loop is only ever paid where a
+	// light can actually land: a sphere overlap for the surface term, and for
+	// the air glow a light near the eye-to-atomic segment, because the glow
+	// shows on geometry far behind the source. Most draws end up with no bits
+	// set and the shader skips the whole block.
+	uint32 lightMask = 0;
+	uint32 ownVehicleBit = 0;
+	if(gvk.pointLightCount > 0 || gvk.playerVehicleActive){
+		const Sphere *bounds = atomic->getWorldBoundingSphere();
+		if(gvk.playerVehicleActive){
+			// Every atomic centre of the occupied vehicle -- doors and
+			// bumpers included -- lies inside its model bounding sphere;
+			// the margin covers the one simulation step between where the
+			// game reported the vehicle and where it renders.
+			const float32 vx =
+				bounds->center.x - gvk.playerVehiclePos[0];
+			const float32 vy =
+				bounds->center.y - gvk.playerVehiclePos[1];
+			const float32 vz =
+				bounds->center.z - gvk.playerVehiclePos[2];
+			const float32 reach = gvk.playerVehicleRadius + 0.75f;
+			if(vx*vx + vy*vy + vz*vz < reach*reach)
+				ownVehicleBit = 0x800000u;
+		}
+		for(uint32 i = 0; i < gvk.pointLightCount; i++){
+			const PointLight &light = gvk.pointLights[i];
+			const float32 dx = bounds->center.x - light.position[0];
+			const float32 dy = bounds->center.y - light.position[1];
+			const float32 dz = bounds->center.z - light.position[2];
+			const float32 reach = bounds->radius + light.radius;
+			if(dx*dx + dy*dy + dz*dz < reach*reach)
+				lightMask |= 1u<<i;
+			if(gvk.pointLightGlowStrength > 0.0f){
+				// Matches the shader's glow radius of 0.4 of the light's.
+				const float32 glowReach =
+					bounds->radius + light.radius*0.4f;
+				if(pointSegmentDistSq(light.position, gvk.cameraWorldPos,
+				                      &bounds->center.x) <
+				   glowReach*glowReach)
+					lightMask |= 1u<<(8+i);
+			}
+		}
+	}
+
 	const VkDeviceSize vertexOffset = 0;
 	vkCmdBindVertexBuffers(commandBuffer, 0, 1, &header->vbo, &vertexOffset);
 	vkCmdBindIndexBuffer(commandBuffer, header->ibo, 0, VK_INDEX_TYPE_UINT16);
@@ -523,7 +588,24 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 			continue;
 
 		if(material && material->texture){
-			SetRenderState(TEXTUREFILTER, material->texture->getFilter());
+			// A world texture that asks for plain LINEAR was authored when
+			// nothing carried a mip chain. It has one now, generated or out
+			// of the dictionary, and the sampler holds a LINEAR request at
+			// level zero -- which is why a leaf mask is sampled at full
+			// resolution from any distance and sparkles. The interface keeps
+			// that clamp: fonts and the radar draw through Im2D, not here.
+			// Only for a chain this backend built. Those are filtered with
+			// the colour weighted by alpha; the ones baked into the model
+			// packs are not, so their levels carry a dark rim around every
+			// shape in the mask and reading them turns foliage and neon into
+			// a lattice. Lift this once the packs are rebuilt with the fixed
+			// txdcompress.
+			uint32 textureFilter = material->texture->getFilter();
+			if(textureFilter == Texture::LINEAR && raster != nil &&
+			   rasterNumLevels(raster) > 1 &&
+			   rasterHasGeneratedMips(raster))
+				textureFilter = Texture::LINEARMIPLINEAR;
+			SetRenderState(TEXTUREFILTER, textureFilter);
 			SetRenderState(TEXTUREADDRESSU, material->texture->getAddressU());
 			SetRenderState(TEXTUREADDRESSV, material->texture->getAddressV());
 		}
@@ -539,9 +621,31 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 		// it the invisible border around a masked element writes depth for
 		// colour it never contributes, and whatever stands behind it is cut
 		// away -- a railing carving its own outline out of a wall.
-		const bool gsSplit = gstate.gsAlphaTest != 0 &&
-			getPs2AlphaTestEnabled() && wantsBlend &&
+		// The class both rules act on: a blended mesh that writes depth
+		// and is not a vehicle -- masked world geometry, which the game
+		// marks by asking for the PS2 rule in the first place.
+		const bool masked = gstate.gsAlphaTest != 0 && wantsBlend &&
 			savedZWrite != 0 && !vehicleAlphaPass;
+		// Alpha to coverage was tried here and taken out again: it turns
+		// the mask into per-sample coverage, and at two or four samples
+		// that is a dither pattern, not a soft edge. On a neon tube or a
+		// leaf it reads as a lattice. Multisampling still earns its place
+		// on the geometry it was made for -- railings, poles, wires.
+		const bool gsSplit = masked && getPs2AlphaTestEnabled();
+		// Leaf masks are the highest frequency in the game and the thing
+		// that sparkles at distance. Nothing spatial can resolve detail
+		// finer than a pixel, so the honest answer is to stop asking for
+		// it: bias the mask down the mip chain and let it soften, which is
+		// what a temporal filter does for this on desktop.
+		//
+		// Keyed off the whole blended mask class, not the depth-writing
+		// half of it. Foliage comes through the alpha list, which draws
+		// back to front with depth writes off, so it never was in the
+		// class the PS2 rule carved out -- the fences and the neon were,
+		// which is why they answered and the leaves did not.
+		const bool blendedMask = wantsBlend && !vehicleAlphaPass &&
+			gstate.alphaTestFunction != ALPHAALWAYS;
+		gstate.mipLodBias = blendedMask ? getMaskedMipBias() : 0;
 		for(int gsPass = 0; gsPass < (gsSplit ? 2 : 1); gsPass++){
 		if((vehicleAlphaPass && wantsBlend) || (gsSplit && gsPass == 1))
 			gstate.zWriteEnabled = 0;
@@ -563,7 +667,6 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 			push.materialColour[3] = material->color.alpha / 255.0f;
 			push.surfaceProps[0] = material->surfaceProps.ambient;
 			push.surfaceProps[1] = material->surfaceProps.diffuse;
-			push.surfaceProps[2] = material->surfaceProps.specular;
 		}else if(material){
 			// No MODULATE flag: the material colour is ignored, exactly as
 			// gl3's setMaterial substitutes white. Surface properties still
@@ -572,14 +675,44 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 			push.materialColour[2] = push.materialColour[3] = 1.0f;
 			push.surfaceProps[0] = material->surfaceProps.ambient;
 			push.surfaceProps[1] = material->surfaceProps.diffuse;
-			push.surfaceProps[2] = material->surfaceProps.specular;
 		}else{
 			push.materialColour[0] = push.materialColour[1] =
 			push.materialColour[2] = push.materialColour[3] = 1.0f;
 			push.surfaceProps[0] = 1.0f;
 			push.surfaceProps[1] = 1.0f;
-			push.surfaceProps[2] = 0.0f;
 		}
+		// The specular coefficient never reached the shaders, so the slot
+		// carries the dynamic-light state for this draw instead, packed as an
+		// exact small integer: bits 0-7 the surface light mask, bits 8-15 the
+		// glow mask, bit 16 whether the mesh brought real normals -- the
+		// per-pixel lights pick between the vertex normal and a facet normal
+		// from derivatives with that one -- bits 17-22 the material's MatFX
+		// env coefficient for the reflection, quantised to 6 bits, and
+		// bit 23 the occupied vehicle, which keeps the panorama layer only.
+		uint32 envBits = 0;
+		if(gvk.carReflections && material != nil &&
+		   (geometry->flags & Geometry::NORMALS)){
+			MatFX *matfx = MatFX::get(material);
+			if(matfx != nil){
+				const int32 slot = matfx->getEffectIndex(MatFX::ENVMAP);
+				if(slot >= 0){
+					// The game quarters every coefficient "for PC"
+					// (SetDefaultEnvironmentMapCB); the PS2 build kept them
+					// as authored, and so does this path.
+					float32 coefficient =
+						matfx->fx[slot].env.coefficient*4.0f;
+					if(coefficient > 1.0f) coefficient = 1.0f;
+					if(coefficient > 0.0f)
+						envBits = (uint32)(coefficient*63.0f + 0.5f);
+					Texture *envTex = matfx->fx[slot].env.tex;
+					if(envTex != nil && envTex->raster != nil)
+						gvk.envRaster = envTex->raster;
+				}
+			}
+		}
+		push.surfaceProps[2] = (float32)(lightMask |
+			((geometry->flags & Geometry::NORMALS) ? 0x10000u : 0u) |
+			envBits << 17 | ownVehicleBit);
 		push.surfaceProps[3] = gsSplit ?
 			(gsPass == 0 ? gstate.gsAlphaTestRef/255.0f :
 				-(float32)gstate.gsAlphaTestRef/255.0f) :
