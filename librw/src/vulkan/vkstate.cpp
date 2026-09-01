@@ -125,6 +125,14 @@ struct State
 	// legally stand in for it.
 	VkImageView whiteViewArray;
 
+	// The water normal map, generated at startup: a tileable Gaussian wave
+	// field, not a handful of sines. Authored-normal-map water is the whole
+	// visual difference between procedural banding and the HL2-class look,
+	// and generating it here keeps the repository free of binary assets.
+	VkImage waterImage;
+	VkDeviceMemory waterMemory;
+	VkImageView waterView;
+
 	// Set 3: the vehicle env streak texture plus the previous frame's scene
 	// colour, rewritten and bound once per frame in beginFrame.
 	VkDescriptorSetLayout envLayout;
@@ -306,6 +314,188 @@ createModule(const uint32_t *code, size_t byteSize)
 	return module;
 }
 
+// The water normal map: a 256x256 tileable Gaussian wave field with a mip
+// chain, built once at startup. Integer wavenumbers keep the tile seamless,
+// and the falling spectrum across fifty-odd components is what reads as
+// chop where a handful of sines reads as interference bands. Generated here
+// so the repository ships no binary asset and the player pushes nothing.
+bool32
+createWaterNormalTexture(void)
+{
+	enum { SIZE = 256, MIPS = 6, WAVES = 52 };
+	static float32 height[SIZE*SIZE];
+	static uint8 pixels[(SIZE*SIZE*4*4)/3 + 256];
+
+	// Fixed seed: the texture is part of the look, not a dice roll.
+	uint32 seed = 0x57A7E12Bu;
+	struct Wave { float32 kx, ky, amp, phase; };
+	Wave waves[WAVES];
+	for(int i = 0; i < WAVES; i++){
+		int kx = 0, ky = 0;
+		while(kx == 0 && ky == 0){
+			seed = seed*1664525u + 1013904223u;
+			kx = (int)(seed >> 28) - 8;
+			seed = seed*1664525u + 1013904223u;
+			ky = (int)(seed >> 28) - 8;
+		}
+		waves[i].kx = (float32)kx;
+		waves[i].ky = (float32)ky;
+		const float32 k2 = (float32)(kx*kx + ky*ky);
+		seed = seed*1664525u + 1013904223u;
+		const float32 jitter =
+			(float32)(seed >> 8)/(float32)0x00FFFFFF;
+		waves[i].amp = (0.6f + 0.4f*jitter)/(1.0f + k2*0.6f);
+		seed = seed*1664525u + 1013904223u;
+		waves[i].phase =
+			(float32)(seed >> 8)/(float32)0x00FFFFFF*6.2831853f;
+	}
+	const float32 cycle = 6.2831853f/(float32)SIZE;
+	for(int y = 0; y < SIZE; y++)
+		for(int x = 0; x < SIZE; x++){
+			float32 h = 0.0f;
+			for(int i = 0; i < WAVES; i++)
+				h += waves[i].amp*
+					cosf((waves[i].kx*(float32)x +
+					      waves[i].ky*(float32)y)*cycle +
+					     waves[i].phase);
+			height[y*SIZE + x] = h;
+		}
+
+	// Base level from wrapped central differences, then a box filter down
+	// the chain so distant water settles instead of sparkling.
+	uint32 levelOffsets[MIPS];
+	uint32 offset = 0;
+	const float32 slopeScale = 2.4f;
+	levelOffsets[0] = 0;
+	for(int y = 0; y < SIZE; y++)
+		for(int x = 0; x < SIZE; x++){
+			const float32 hx = height[y*SIZE + ((x+1)&(SIZE-1))] -
+				height[y*SIZE + ((x-1)&(SIZE-1))];
+			const float32 hy =
+				height[((y+1)&(SIZE-1))*SIZE + x] -
+				height[((y-1)&(SIZE-1))*SIZE + x];
+			float32 nx = -hx*slopeScale, ny = -hy*slopeScale, nz = 1.0f;
+			const float32 inverseLength =
+				1.0f/sqrtf(nx*nx + ny*ny + nz*nz);
+			uint8 *p = &pixels[(y*SIZE + x)*4];
+			p[0] = (uint8)((nx*inverseLength*0.5f + 0.5f)*255.0f);
+			p[1] = (uint8)((ny*inverseLength*0.5f + 0.5f)*255.0f);
+			p[2] = (uint8)((nz*inverseLength*0.5f + 0.5f)*255.0f);
+			p[3] = 0xFF;
+		}
+	offset = SIZE*SIZE*4;
+	for(int level = 1; level < MIPS; level++){
+		const int parent = SIZE >> (level-1);
+		const int size = SIZE >> level;
+		const uint8 *src = &pixels[levelOffsets[level-1]];
+		levelOffsets[level] = offset;
+		uint8 *dst = &pixels[offset];
+		for(int y = 0; y < size; y++)
+			for(int x = 0; x < size; x++){
+				float32 nx = 0.0f, ny = 0.0f, nz = 0.0f;
+				for(int sy = 0; sy < 2; sy++)
+					for(int sx = 0; sx < 2; sx++){
+						const uint8 *s = &src[((y*2+sy)*parent +
+						                       x*2+sx)*4];
+						nx += (float32)s[0]/127.5f - 1.0f;
+						ny += (float32)s[1]/127.5f - 1.0f;
+						nz += (float32)s[2]/127.5f - 1.0f;
+					}
+				const float32 inverseLength =
+					1.0f/sqrtf(nx*nx + ny*ny + nz*nz);
+				uint8 *p = &dst[(y*size + x)*4];
+				p[0] = (uint8)((nx*inverseLength*0.5f + 0.5f)*255.0f);
+				p[1] = (uint8)((ny*inverseLength*0.5f + 0.5f)*255.0f);
+				p[2] = (uint8)((nz*inverseLength*0.5f + 0.5f)*255.0f);
+				p[3] = 0xFF;
+			}
+		offset += size*size*4;
+	}
+
+	VkImageCreateInfo imageInfo = {};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+	imageInfo.extent.width = SIZE;
+	imageInfo.extent.height = SIZE;
+	imageInfo.extent.depth = 1;
+	imageInfo.mipLevels = MIPS;
+	imageInfo.arrayLayers = 1;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+		VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if(vkCreateImage(gvk.device, &imageInfo, nil,
+	                 &gs.waterImage) != VK_SUCCESS)
+		return 0;
+	VkMemoryRequirements requirements;
+	vkGetImageMemoryRequirements(gvk.device, gs.waterImage, &requirements);
+	uint32 typeIndex = 0;
+	if(!findMemoryType(requirements.memoryTypeBits,
+	                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &typeIndex))
+		return 0;
+	VkMemoryAllocateInfo allocInfo = {};
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = requirements.size;
+	allocInfo.memoryTypeIndex = typeIndex;
+	if(vkAllocateMemory(gvk.device, &allocInfo, nil,
+	                    &gs.waterMemory) != VK_SUCCESS ||
+	   vkBindImageMemory(gvk.device, gs.waterImage,
+	                     gs.waterMemory, 0) != VK_SUCCESS)
+		return 0;
+
+	VkBuffer staging = VK_NULL_HANDLE;
+	VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+	if(!createBuffer(offset, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+	                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	                 &staging, &stagingMemory))
+		return 0;
+	void *mapped = nil;
+	vkMapMemory(gvk.device, stagingMemory, 0, offset, 0, &mapped);
+	memcpy(mapped, pixels, offset);
+	vkUnmapMemory(gvk.device, stagingMemory);
+
+	VkCommandBuffer commandBuffer = beginOneShot();
+	transitionImageLayout(commandBuffer, gs.waterImage,
+	                      VK_IMAGE_ASPECT_COLOR_BIT, MIPS,
+	                      VK_IMAGE_LAYOUT_UNDEFINED,
+	                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+	VkBufferImageCopy regions[MIPS] = {};
+	for(int level = 0; level < MIPS; level++){
+		regions[level].bufferOffset = levelOffsets[level];
+		regions[level].imageSubresource.aspectMask =
+			VK_IMAGE_ASPECT_COLOR_BIT;
+		regions[level].imageSubresource.mipLevel = level;
+		regions[level].imageSubresource.layerCount = 1;
+		regions[level].imageExtent.width = SIZE >> level;
+		regions[level].imageExtent.height = SIZE >> level;
+		regions[level].imageExtent.depth = 1;
+	}
+	vkCmdCopyBufferToImage(commandBuffer, staging, gs.waterImage,
+	                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                       MIPS, regions);
+	transitionImageLayout(commandBuffer, gs.waterImage,
+	                      VK_IMAGE_ASPECT_COLOR_BIT, MIPS,
+	                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	endOneShot(commandBuffer);
+	vkDestroyBuffer(gvk.device, staging, nil);
+	vkFreeMemory(gvk.device, stagingMemory, nil);
+
+	VkImageViewCreateInfo viewInfo = {};
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = gs.waterImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = MIPS;
+	viewInfo.subresourceRange.layerCount = 1;
+	return vkCreateImageView(gvk.device, &viewInfo, nil,
+	                         &gs.waterView) == VK_SUCCESS;
+}
+
 bool32
 createWhiteTexture(void)
 {
@@ -484,17 +674,20 @@ stateInit(void)
 	// Set 3: what the reflection block in rw_world.frag samples -- the
 	// vehicle env streak art and the previous frame's scene colour, written
 	// and bound once per frame in beginFrame.
-	VkDescriptorSetLayoutBinding envBindings[2] = {};
+	VkDescriptorSetLayoutBinding envBindings[3] = {};
 	envBindings[0].binding = 0;
 	envBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	envBindings[0].descriptorCount = 1;
 	envBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 	envBindings[1] = envBindings[0];
 	envBindings[1].binding = 1;
+	// The generated water normal map.
+	envBindings[2] = envBindings[0];
+	envBindings[2].binding = 2;
 
 	VkDescriptorSetLayoutCreateInfo envLayoutInfo = {};
 	envLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	envLayoutInfo.bindingCount = 2;
+	envLayoutInfo.bindingCount = 3;
 	envLayoutInfo.pBindings = envBindings;
 	if(vkCreateDescriptorSetLayout(gvk.device, &envLayoutInfo, nil,
 	                               &gs.envLayout) != VK_SUCCESS)
@@ -526,10 +719,10 @@ stateInit(void)
 	poolSizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	poolSizes[3].descriptorCount = NUM_FRAME_CONTEXTS;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	// +1 white, +2 per frame context for the env/reflection set.
+	// +1 white, +3 per frame context for the env/reflection/water set.
 	poolSizes[1].descriptorCount =
 		MAX_TEXTURE_DESCRIPTORS*NUM_FRAME_CONTEXTS + 1 +
-		2*NUM_FRAME_CONTEXTS;
+		3*NUM_FRAME_CONTEXTS;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
 	poolSizes[2].descriptorCount = NUM_FRAME_CONTEXTS;
 
@@ -657,6 +850,8 @@ stateInit(void)
 	if(gs.boneAlignment == 0)
 		gs.boneAlignment = 256;
 
+	if(!createWaterNormalTexture())
+		return 0;
 	if(!createWhiteTexture())
 		return 0;
 
@@ -769,13 +964,23 @@ stateShutdown(void)
 						gs.modules[ov][os] = VK_NULL_HANDLE;
 		}
 
-	for(int i = 0; i < 64; i++)
+	// Over the whole table. It was sized 64 when the key only held a
+	// filter and two address modes; the bias widened it to 512 and
+	// this loop kept freeing the first sixty-four.
+	for(uint32 i = 0; i < sizeof(gs.samplers)/sizeof(gs.samplers[0]); i++)
 		if(gs.samplers[i])
 			vkDestroySampler(gvk.device, gs.samplers[i], nil);
 
 	if(gs.whiteView) vkDestroyImageView(gvk.device, gs.whiteView, nil);
+	if(gs.whiteViewArray)
+		vkDestroyImageView(gvk.device, gs.whiteViewArray, nil);
 	if(gs.whiteImage) vkDestroyImage(gvk.device, gs.whiteImage, nil);
 	if(gs.whiteMemory) vkFreeMemory(gvk.device, gs.whiteMemory, nil);
+	if(gs.waterView) vkDestroyImageView(gvk.device, gs.waterView, nil);
+	if(gs.waterImage) vkDestroyImage(gvk.device, gs.waterImage, nil);
+	if(gs.waterMemory) vkFreeMemory(gvk.device, gs.waterMemory, nil);
+	if(gs.envLayout)
+		vkDestroyDescriptorSetLayout(gvk.device, gs.envLayout, nil);
 
 	for(uint32 frame = 0; frame < NUM_FRAME_CONTEXTS; frame++){
 		StateFrame &sf = gs.frames[frame];
@@ -1244,7 +1449,7 @@ bindEnvironmentDescriptor(VkCommandBuffer commandBuffer,
 			streakView = native->view;
 	}
 
-	VkDescriptorImageInfo images[2] = {};
+	VkDescriptorImageInfo images[3] = {};
 	images[0].sampler = getSampler(makeSamplerKey(Texture::LINEAR,
 	                                              Texture::WRAP,
 	                                              Texture::WRAP, 0),
@@ -1260,9 +1465,18 @@ bindEnvironmentDescriptor(VkCommandBuffer commandBuffer,
 	images[1].imageView = previousScene != VK_NULL_HANDLE ?
 		previousScene : gs.whiteViewArray;
 	images[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	// The water normal map wants the mip chain, hence trilinear.
+	images[2].sampler = getSampler(makeSamplerKey(Texture::LINEARMIPLINEAR,
+	                                              Texture::WRAP,
+	                                              Texture::WRAP, 0),
+	                               Texture::LINEARMIPLINEAR,
+	                               Texture::WRAP, Texture::WRAP);
+	images[2].imageView = gs.waterView != VK_NULL_HANDLE ?
+		gs.waterView : gs.whiteView;
+	images[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-	VkWriteDescriptorSet writes[2] = {};
-	for(uint32 i = 0; i < 2; i++){
+	VkWriteDescriptorSet writes[3] = {};
+	for(uint32 i = 0; i < 3; i++){
 		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 		writes[i].dstSet = set;
 		writes[i].dstBinding = i;
@@ -1271,7 +1485,7 @@ bindEnvironmentDescriptor(VkCommandBuffer commandBuffer,
 			VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		writes[i].pImageInfo = &images[i];
 	}
-	vkUpdateDescriptorSets(gvk.device, 2, writes, 0, nil);
+	vkUpdateDescriptorSets(gvk.device, 3, writes, 0, nil);
 	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
 	                        gs.pipelineLayout, 3, 1, &set, 0, nil);
 }

@@ -62,8 +62,20 @@ layout(set = 0, binding = 0) uniform SceneData {
 	uvec4 im2dCoverage[4];
 	// x = overall reflection intensity, y = SSR weight inside it, z = how
 	// far from the eye the SSR part reaches in metres before fading to the
-	// panorama. All player-tuned; 1.0 / 1.0 / huge is the baseline.
+	// panorama, w = game-time seconds for the water ripples. Player-tuned;
+	// 1.0 / 1.0 / huge is the baseline.
 	vec4 reflectionParams;
+	// xyz = direction toward the sun in play space, w = its colour as
+	// RGBA8; the modern-water glint reads it.
+	vec4 waterSun;
+	// Play space back to game world; the water ripple field anchors there.
+	mat4 playToWorld;
+	// The WATER page sliders as multipliers of the base recipe:
+	// waterParams1 = wave steepness / scroll speed / mirror distortion /
+	// reflection strength, waterParams2 = sky sheen / sun glint / light
+	// sparks / unused.
+	vec4 waterParams1;
+	vec4 waterParams2;
 } scene;
 
 layout(push_constant) uniform PushConstants {

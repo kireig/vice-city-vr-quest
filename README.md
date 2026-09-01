@@ -37,7 +37,7 @@ This repository contains the original Quest/OpenXR port layer, Vulkan backend
 changes, build scripts and reVC patch files needed to build Vice City VR for a
 Meta Quest headset.
 
-Current source-kit version: **v0.5.4 alpha**.
+Current source-kit version: **v0.5.5 alpha**.
 
 It intentionally contains **no APK, complete reVC source tree, original game
 files, saves, logs or third-party Modern model packs**. Every user builds their
@@ -114,6 +114,18 @@ The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
   ships is screen-space, reprojecting the previous frame onto the bodywork
   over the model's own streak art. Strength, range and sampled resolution
   are adjustable. Off by default -- it is the most expensive option here.
+- Modern water. The bay, the canals and the pool water keep Rockstar's own
+  art and gain a wave field on top of it: a generated normal map scrolled
+  as two layers, anchored in world coordinates so the swell stays put as
+  the player moves. At a grazing angle Fresnel turns the surface into a
+  mirror of the previous frame -- the same one the cars use -- so the
+  skyline, the neon and the headlights land on the water; looking straight
+  down it stays the original texture. The sun draws a glint across the
+  ripples and the dynamic lights scatter sparks over them at night.
+  Waves, speed, distortion, mirror strength, sky sheen, glint and sparks
+  are separate sliders under EFFECTS > MODERN WATER. Off by default --
+  it costs about what the vehicle reflection does -- and one integer
+  test per water pixel while it is.
 - Optional PS2 two-pass alpha rule for masked geometry, which removes the
   faint outline a railing or fence carves out of the wall behind it. Off
   by default: it draws every masked mesh twice, and a Vice City street is
@@ -132,8 +144,11 @@ The source-only maintainer checks are in [RELEASING.md](RELEASING.md).
   eyes or disappears incorrectly.
 - Modern vehicles can be expensive on Quest, especially with high traffic;
   Classic vehicles remain the default and the recommended fallback.
-- Pedestrian and vehicle density run from OFF to 300%. OFF stops new
-  spawns rather than deleting what is already on the street.
+- Pedestrian and vehicle density run from OFF to 300%, opening at 135%
+  for pedestrians and 100% for vehicles: a full street is the most
+  expensive thing the GPU draws, while the crowd is what carries the
+  life of the place. OFF stops new spawns rather than deleting what is
+  already on the street.
 - Normal frontend/save loading on first launch; the developer Quick Test Start
   shortcut remains available but is off by default.
 

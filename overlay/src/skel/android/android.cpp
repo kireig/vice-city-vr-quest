@@ -1476,7 +1476,7 @@ Initialise(const VulkanContext &context, bool *renderTargetStartupFailure)
 	// reduced is the player-s, because the right answer depends on the
 	// render scale it is paired with. One reads the frame itself.
 	backendParams.sceneReflectionDivisor =
-		GetPrivateProfileIntA("VR", "CarReflectionScale", 4,
+		GetPrivateProfileIntA("VR", "CarReflectionScale", 1,
 			".\\vr_settings.ini");
 	backendParams.sceneWidth = context.width;
 	backendParams.sceneHeight = context.height;

@@ -519,6 +519,10 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 	// set and the shader skips the whole block.
 	uint32 lightMask = 0;
 	uint32 ownVehicleBit = 0;
+	// The near water renders as atomics (the wavy and mask patches), so the
+	// water bit has to travel this path too, not only vkim's.
+	const uint32 waterBit =
+		gvk.modernWater && gvk.im3dWaterDraw ? 0x1000000u : 0u;
 	if(gvk.pointLightCount > 0 || gvk.playerVehicleActive){
 		const Sphere *bounds = atomic->getWorldBoundingSphere();
 		if(gvk.playerVehicleActive){
@@ -712,7 +716,7 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 		}
 		push.surfaceProps[2] = (float32)(lightMask |
 			((geometry->flags & Geometry::NORMALS) ? 0x10000u : 0u) |
-			envBits << 17 | ownVehicleBit);
+			envBits << 17 | ownVehicleBit | waterBit);
 		push.surfaceProps[3] = gsSplit ?
 			(gsPass == 0 ? gstate.gsAlphaTestRef/255.0f :
 				-(float32)gstate.gsAlphaTestRef/255.0f) :

@@ -29,6 +29,7 @@
 #include "Renderer.h"
 #include "Shadows.h"
 #include "PointLights.h"
+#include "Timecycle.h"
 #include "ParticleObject.h"
 #include "CutsceneMgr.h"
 #include "Camera.h"
@@ -191,12 +192,30 @@ static int gCarReflections = 0;
 static int gCarReflectionIntensity = 100;
 static int gCarReflectionSsr = 100;
 static int gCarReflectionSsrDistance = 0;
+// Modern water: world-anchored ripples, Fresnel, the same previous-frame
+// city reflection the cars use, and the sun's path across the ripple field.
+// Off by default: measured against the frame it costs about what the
+// vehicle reflection does, and everything at that price ships off.
+// One integer test per water pixel until someone turns it on.
+static int gModernWater = 0;
+// The WATER page sliders, percent of the shader's base recipe. WAVES is the
+// ripple steepness, DISTORTION how far the ripples smear the mirrored
+// picture, REFLECTION the mirror itself, SHEEN the flat-sky fallback where
+// the mirror has no answer, GLINT and SPARKS the sun and dynamic-light
+// speculars.
+static int gWaterWaves = 100;
+static int gWaterSpeed = 80;
+static int gWaterDistortion = 55;
+static int gWaterReflection = 80;
+static int gWaterSheen = 100;
+static int gWaterGlint = 100;
+static int gWaterSparks = 100;
 // How far the finished frame is reduced before the reflection samples
 // it, with 1 reading the frame itself. It changes how soft the mirrored
 // street looks and how much memory the copy takes; it does not change
 // the frame time, which is what it was added to test. Read by the
 // backend at startup, hence the restart.
-static int gCarReflectionScale = 4;
+static int gCarReflectionScale = 1;
 // Renderer counters in logcat. A shipped build has no business
 // writing to a player log every ten seconds, so this stays off
 // unless it is asked for.
@@ -413,6 +432,7 @@ static int gVrMenuPage;
 static int gVrMenuSelection;
 static int gVrGraphicsSelection;
 static int gVrLightingSelection;
+static int gVrWaterSelection;
 static int gVrWeaponsSelection;
 static int gVrHudSelection;
 static int gVrWristRadarSelection;
@@ -441,7 +461,7 @@ static int gVrMissionCategory = -1;
 static int gVrMissionCategorySelection;
 static int gVrMissionSelection;
 static int gTrafficPedPercent = 135;
-static int gTrafficCarPercent = 135;
+static int gTrafficCarPercent = 100;
 static int gQuestCpuPerformanceMode;
 static int gQuestCpuPerformanceSavedMode;
 static int gQuestGpuPerformanceMode = 1; // SUSTAINED; enum is declared below.
@@ -450,6 +470,7 @@ enum {
 	VR_MENU_PAGE_SETTINGS,
 	VR_MENU_PAGE_GRAPHICS,
 	VR_MENU_PAGE_LIGHTING,
+	VR_MENU_PAGE_WATER,
 	VR_MENU_PAGE_WEAPONS,
 	VR_MENU_PAGE_HUD,
 	VR_MENU_PAGE_WRIST_RADAR,
@@ -476,8 +497,25 @@ enum eVrLightingMenuItem {
 	VR_LIGHTING_REFLECTION_SSR,
 	VR_LIGHTING_SSR_DISTANCE,
 	VR_LIGHTING_SSR_SCALE,
+	VR_LIGHTING_MODERN_WATER,
 	VR_LIGHTING_BACK,
 	VR_LIGHTING_ITEM_COUNT
+};
+
+enum eVrWaterMenuItem {
+	VR_WATER_ENABLED = 0,
+	VR_WATER_WAVES,
+	VR_WATER_SPEED,
+	VR_WATER_DISTORTION,
+	VR_WATER_REFLECTION,
+	VR_WATER_SHEEN,
+	VR_WATER_GLINT,
+	VR_WATER_SPARKS,
+	// The same reduced copy the cars sample; this row edits the same
+	// setting as the EFFECTS page so neither hides the other.
+	VR_WATER_SSR_SCALE,
+	VR_WATER_BACK,
+	VR_WATER_ITEM_COUNT
 };
 
 enum eVrTrafficMenuItem {
@@ -872,7 +910,7 @@ LoadVrSettings(void)
 	gCarReflectionSsr = clamp((int)(int32)GetPrivateProfileIntA("VR",
 		"CarReflectionSsr", 100, ".\\vr_settings.ini"), 0, 150);
 	gCarReflectionScale = GetPrivateProfileIntA("VR",
-		"CarReflectionScale", 4, ".\\vr_settings.ini");
+		"CarReflectionScale", 1, ".\\vr_settings.ini");
 	if(gCarReflectionScale != 1 && gCarReflectionScale != 2 &&
 	   gCarReflectionScale != 4 && gCarReflectionScale != 8)
 		gCarReflectionScale = 4;
@@ -880,6 +918,22 @@ LoadVrSettings(void)
 		"CarReflectionSsrDistance", 0, ".\\vr_settings.ini"), 0, 150);
 	if(gCarReflectionSsrDistance != 0 && gCarReflectionSsrDistance < 5)
 		gCarReflectionSsrDistance = 5;
+	gModernWater = GetPrivateProfileIntA("VR", "ModernWater", 0,
+		".\\vr_settings.ini") != 0 ? 1 : 0;
+	gWaterWaves = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"WaterWaves", 100, ".\\vr_settings.ini"), 0, 200);
+	gWaterSpeed = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"WaterSpeed", 80, ".\\vr_settings.ini"), 0, 200);
+	gWaterDistortion = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"WaterDistortion", 55, ".\\vr_settings.ini"), 0, 200);
+	gWaterReflection = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"WaterReflection", 80, ".\\vr_settings.ini"), 0, 200);
+	gWaterSheen = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"WaterSheen", 100, ".\\vr_settings.ini"), 0, 200);
+	gWaterGlint = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"WaterGlint", 100, ".\\vr_settings.ini"), 0, 200);
+	gWaterSparks = clamp((int)(int32)GetPrivateProfileIntA("VR",
+		"WaterSparks", 100, ".\\vr_settings.ini"), 0, 200);
 	gRenderDiagnostics = GetPrivateProfileIntA("VR",
 		"RenderDiagnostics", 0, ".\\vr_settings.ini") != 0 ? 1 : 0;
 	gFoliageSoftness = clamp((int)(int32)GetPrivateProfileIntA("VR",
@@ -1125,8 +1179,10 @@ LoadVrSettings(void)
 		0, ".\\vr_settings.ini") != 0 ? 1 : 0;
 	const int defaultPedPercent = Min(Max(
 		(int)(CIniFile::PedNumberMultiplier*100.0f+0.5f), 50), 300);
-	const int defaultCarPercent = Min(Max(
-		(int)(CIniFile::CarNumberMultiplier*100.0f+0.5f), 50), 300);
+	// Vehicles stay at the stock count. reVC opens at 135% and it is too
+	// much for a headset: a full street is the most expensive thing the
+	// GPU draws, and the pedestrians carry the life of the place anyway.
+	const int defaultCarPercent = 100;
 	// Down to nothing at all. Half density was the old floor, which
 	// left no way to actually empty a street -- for looking at one
 	// car, or for measuring anything against a stable frame.
@@ -1562,6 +1618,7 @@ CurrentMenuSelection(void)
 	switch(gVrMenuPage){
 	case VR_MENU_PAGE_GRAPHICS: return &gVrGraphicsSelection;
 	case VR_MENU_PAGE_LIGHTING: return &gVrLightingSelection;
+	case VR_MENU_PAGE_WATER: return &gVrWaterSelection;
 	case VR_MENU_PAGE_WEAPONS: return &gVrWeaponsSelection;
 	case VR_MENU_PAGE_HUD: return &gVrHudSelection;
 	case VR_MENU_PAGE_WRIST_RADAR: return &gVrWristRadarSelection;
@@ -1589,6 +1646,7 @@ CurrentMenuItemCount(void)
 	case VR_MENU_PAGE_SETTINGS: return VR_MAIN_ITEM_COUNT;
 	case VR_MENU_PAGE_GRAPHICS: return VR_GRAPHICS_ITEM_COUNT;
 	case VR_MENU_PAGE_LIGHTING: return VR_LIGHTING_ITEM_COUNT;
+	case VR_MENU_PAGE_WATER: return VR_WATER_ITEM_COUNT;
 	case VR_MENU_PAGE_WEAPONS: return VR_WEAPONS_ITEM_COUNT;
 	case VR_MENU_PAGE_HUD: return VR_HUD_ITEM_COUNT;
 	case VR_MENU_PAGE_WRIST_RADAR: return VR_WRIST_ITEM_COUNT;
@@ -1725,6 +1783,9 @@ CurrentMenuValueRepeats(void)
 			gVrLightingSelection == VR_LIGHTING_REFLECTION_INTENSITY ||
 			gVrLightingSelection == VR_LIGHTING_REFLECTION_SSR ||
 			gVrLightingSelection == VR_LIGHTING_SSR_DISTANCE;
+	if(gVrMenuPage == VR_MENU_PAGE_WATER)
+		return gVrWaterSelection >= VR_WATER_WAVES &&
+			gVrWaterSelection <= VR_WATER_SPARKS;
 	if(gVrMenuPage == VR_MENU_PAGE_VEHICLE)
 		return gVrVehicleSelection >= VR_VEHICLE_DEFAULT_SEAT_HEIGHT &&
 			gVrVehicleSelection <= VR_VEHICLE_MODEL_SEAT_FORWARD;
@@ -1765,6 +1826,10 @@ ReturnFromCurrentMenuPage(void)
 	}
 	if(gVrMenuPage == VR_MENU_PAGE_LIGHTING){
 		gVrMenuPage = VR_MENU_PAGE_GRAPHICS;
+		return;
+	}
+	if(gVrMenuPage == VR_MENU_PAGE_WATER){
+		gVrMenuPage = VR_MENU_PAGE_LIGHTING;
 		return;
 	}
 	gVrMenuPage = VR_MENU_PAGE_SETTINGS;
@@ -2252,8 +2317,54 @@ VrDebugUpdate(const PadInput &in)
 					(int)ARRAY_SIZE(scales);
 				gCarReflectionScale = scales[index];
 				SaveVrInteger("CarReflectionScale", gCarReflectionScale);
+			}else if(gVrLightingSelection == VR_LIGHTING_MODERN_WATER){
+				gVrMenuPage = VR_MENU_PAGE_WATER;
+				gVrWaterSelection = 0;
 			}else if(gVrLightingSelection == VR_LIGHTING_BACK){
 				gVrMenuPage = VR_MENU_PAGE_GRAPHICS;
+			}
+		}else if(gVrMenuPage == VR_MENU_PAGE_WATER &&
+		         (positivePulse || decreasePulse)){
+			const int direction = decreasePulse ? -1 : 1;
+			const int step = direction*Max(1, repeatMagnitude);
+			if(gVrWaterSelection == VR_WATER_ENABLED){
+				gModernWater = !gModernWater;
+				SaveVrInteger("ModernWater", gModernWater);
+			}else if(gVrWaterSelection == VR_WATER_WAVES){
+				gWaterWaves = clamp(gWaterWaves+step*5, 0, 200);
+				SaveVrInteger("WaterWaves", gWaterWaves);
+			}else if(gVrWaterSelection == VR_WATER_SPEED){
+				gWaterSpeed = clamp(gWaterSpeed+step*5, 0, 200);
+				SaveVrInteger("WaterSpeed", gWaterSpeed);
+			}else if(gVrWaterSelection == VR_WATER_DISTORTION){
+				gWaterDistortion = clamp(
+					gWaterDistortion+step*5, 0, 200);
+				SaveVrInteger("WaterDistortion", gWaterDistortion);
+			}else if(gVrWaterSelection == VR_WATER_REFLECTION){
+				gWaterReflection = clamp(
+					gWaterReflection+step*5, 0, 200);
+				SaveVrInteger("WaterReflection", gWaterReflection);
+			}else if(gVrWaterSelection == VR_WATER_SHEEN){
+				gWaterSheen = clamp(gWaterSheen+step*5, 0, 200);
+				SaveVrInteger("WaterSheen", gWaterSheen);
+			}else if(gVrWaterSelection == VR_WATER_GLINT){
+				gWaterGlint = clamp(gWaterGlint+step*5, 0, 200);
+				SaveVrInteger("WaterGlint", gWaterGlint);
+			}else if(gVrWaterSelection == VR_WATER_SPARKS){
+				gWaterSparks = clamp(gWaterSparks+step*5, 0, 200);
+				SaveVrInteger("WaterSparks", gWaterSparks);
+			}else if(gVrWaterSelection == VR_WATER_SSR_SCALE){
+				static const int scales[] = { 1, 2, 4, 8 };
+				int index = 0;
+				for(int i = 0; i < (int)ARRAY_SIZE(scales); i++)
+					if(scales[i] == gCarReflectionScale)
+						index = i;
+				index = (index+direction+(int)ARRAY_SIZE(scales))%
+					(int)ARRAY_SIZE(scales);
+				gCarReflectionScale = scales[index];
+				SaveVrInteger("CarReflectionScale", gCarReflectionScale);
+			}else if(gVrWaterSelection == VR_WATER_BACK){
+				gVrMenuPage = VR_MENU_PAGE_LIGHTING;
 			}
 		}else if(gVrMenuPage == VR_MENU_PAGE_TRAFFIC &&
 		         (positivePulse || decreasePulse)){
@@ -2302,7 +2413,7 @@ VrDebugUpdate(const PadInput &in)
 			}
 			case VR_TRAFFIC_DEFAULTS:
 				gTrafficPedPercent = 135;
-				gTrafficCarPercent = 135;
+				gTrafficCarPercent = 100;
 				QuestPhysicsDirectorSetMode(
 					QUEST_PHYSICS_DIRECTOR_ADAPTIVE);
 				QuestPhysicsDirectorSetPreset(
@@ -2874,7 +2985,8 @@ QuestMenuPageColour(uint8 *red, uint8 *green, uint8 *blue)
 	int category = -1;
 	switch(gVrMenuPage){
 	case VR_MENU_PAGE_GRAPHICS:
-	case VR_MENU_PAGE_LIGHTING: category = VR_MAIN_GRAPHICS; break;
+	case VR_MENU_PAGE_LIGHTING:
+	case VR_MENU_PAGE_WATER: category = VR_MAIN_GRAPHICS; break;
 	case VR_MENU_PAGE_TRAFFIC: category = VR_MAIN_TRAFFIC_SETTINGS; break;
 	case VR_MENU_PAGE_HUD:
 	case VR_MENU_PAGE_WRIST_RADAR: category = VR_MAIN_HUD; break;
@@ -3176,6 +3288,8 @@ DrawQuestLightingPage(void)
 		gCarReflectionScale == 1 ? "FULL" :
 		gCarReflectionScale == 2 ? "HALF" :
 		gCarReflectionScale == 4 ? "QUARTER" : "EIGHTH");
+	snprintf(rows[VR_LIGHTING_MODERN_WATER], sizeof(rows[0]),
+		"MODERN WATER  < OPEN - %s >", gModernWater ? "ON" : "OFF");
 	strcpy(rows[VR_LIGHTING_BACK], "BACK TO GRAPHICS");
 	for(int item = 0; item < VR_LIGHTING_ITEM_COUNT; item++)
 		DrawFullVrMenuRow(rows[item], 166+item*40, 2,
@@ -3184,6 +3298,45 @@ DrawQuestLightingPage(void)
 		VR_MENU_WIDTH/2, 620, 2, 170, 190, 210);
 	DrawVrMenuText("SSR 0% OR A SHORT SSR DISTANCE GIVES THE CLASSIC LOOK",
 		VR_MENU_WIDTH/2, 644, 2, 170, 190, 210);
+}
+
+static void
+DrawQuestWaterPage(void)
+{
+	BeginFullVrMenuPage("MODERN WATER",
+		"WAVES, MIRROR AND SPECULARS OVER THE ORIGINAL WATER");
+	char rows[VR_WATER_ITEM_COUNT][112];
+	snprintf(rows[VR_WATER_ENABLED], sizeof(rows[0]),
+		"MODERN WATER  < %s >", gModernWater ? "ON" : "OFF");
+	snprintf(rows[VR_WATER_WAVES], sizeof(rows[0]),
+		"WAVE STRENGTH  < %d%% >", gWaterWaves);
+	snprintf(rows[VR_WATER_SPEED], sizeof(rows[0]),
+		"WAVE SPEED  < %d%% >", gWaterSpeed);
+	snprintf(rows[VR_WATER_DISTORTION], sizeof(rows[0]),
+		"MIRROR DISTORTION  < %d%% >", gWaterDistortion);
+	snprintf(rows[VR_WATER_REFLECTION], sizeof(rows[0]),
+		"REFLECTION  < %d%% >", gWaterReflection);
+	snprintf(rows[VR_WATER_SHEEN], sizeof(rows[0]),
+		"SKY SHEEN  < %d%% >", gWaterSheen);
+	snprintf(rows[VR_WATER_GLINT], sizeof(rows[0]),
+		"SUN GLINT  < %d%% >", gWaterGlint);
+	snprintf(rows[VR_WATER_SPARKS], sizeof(rows[0]),
+		"LIGHT SPARKS  < %d%% >", gWaterSparks);
+	snprintf(rows[VR_WATER_SSR_SCALE], sizeof(rows[0]),
+		"SSR RESOLUTION  < %s - RESTART >",
+		gCarReflectionScale == 1 ? "FULL" :
+		gCarReflectionScale == 2 ? "HALF" :
+		gCarReflectionScale == 4 ? "QUARTER" : "EIGHTH");
+	strcpy(rows[VR_WATER_BACK], "BACK TO EFFECTS");
+	for(int item = 0; item < VR_WATER_ITEM_COUNT; item++)
+		DrawFullVrMenuRow(rows[item], 166+item*40, 2,
+			item == gVrWaterSelection, true, false);
+	DrawVrMenuText("BLUR AND SHIMMER LIVE IN WAVES AND DISTORTION - TURN THEM DOWN",
+		VR_MENU_WIDTH/2, 620, 2, 170, 190, 210);
+	DrawVrMenuText("REFLECTION IS THE MIRROR, SHEEN THE SKY WHERE IT CANNOT REACH",
+		VR_MENU_WIDTH/2, 644, 2, 170, 190, 210);
+	DrawVrMenuText("SSR RESOLUTION IS ONE COPY SHARED WITH CAR REFLECTIONS",
+		VR_MENU_WIDTH/2, 668, 2, 170, 190, 210);
 }
 
 static void
@@ -3214,7 +3367,7 @@ DrawQuestTrafficPage(void)
 		"MODERN CAR VISUALS  < %s >",
 		QuestVehicleVisualBudgetGetModeName());
 	strcpy(rows[VR_TRAFFIC_DEFAULTS],
-		"RESTORE DEFAULTS  < 135% / MEASURE / BALANCED / STOCK >");
+		"RESTORE DEFAULTS  < 135/100% / MEASURE / BALANCED / STOCK >");
 	strcpy(rows[VR_TRAFFIC_BACK], "BACK TO SETTINGS");
 	const bool modernVehicles = ModelSets::GetActiveForCategory(
 		ModelSets::MODEL_CATEGORY_VEHICLES) == ModelSets::MODEL_SET_MODERN;
@@ -3906,7 +4059,7 @@ DrawQuestAboutPage(void)
 		"IF TRAFFIC MISBEHAVES: TRAFFIC > PHYSICS DIRECTOR > ORIGINAL",
 		"THE FULL CAMPAIGN IS PLAYABLE, BUT THE MOD IS STILL IN DEVELOPMENT",
 		"DISCUSSION: FLAT2VR DISCORD",
-		"discord.com/channels/747967102895390741/1529621098751197365",
+		"discord.com/channels/747967102895390741/1543691482861408276",
 		"PRESS ANY BUTTON TO CLOSE"
 	};
 	for(int index = 0; index < (int)ARRAY_SIZE(lines); index++){
@@ -3949,6 +4102,9 @@ VrDebugPixels(int *width, int *height)
 			break;
 		case VR_MENU_PAGE_LIGHTING:
 			DrawQuestLightingPage();
+			break;
+		case VR_MENU_PAGE_WATER:
+			DrawQuestWaterPage();
 			break;
 		case VR_MENU_PAGE_WEAPONS:
 			DrawQuestWeaponsPage();
@@ -4337,6 +4493,22 @@ VrPushDynamicLights(void)
 		gCarReflectionSsr/100.0f,
 		gCarReflectionSsrDistance == 0 ?
 			100000.0f : (float)gCarReflectionSsrDistance);
+	rw::vulkan::setModernWaterEnabled(gModernWater);
+	rw::vulkan::setWaterParams(gWaterWaves/100.0f, gWaterSpeed/100.0f,
+		gWaterDistortion/100.0f, gWaterReflection/100.0f,
+		gWaterSheen/100.0f, gWaterGlint/100.0f, gWaterSparks/100.0f);
+	// Game time, so the ripples freeze with the pause menu. Wrapped as
+	// milliseconds, before the float: past four hours of play a 32-bit
+	// millisecond count no longer fits a float mantissa exactly, and
+	// wrapping after the conversion would have left the ripples
+	// stepping in whole frames.
+	rw::vulkan::setEffectsTime(
+		(float)(CTimer::GetTimeInMilliseconds() % 3600000u)*0.001f);
+	const CVector &sunDirection = CTimeCycle::GetSunDirection();
+	rw::vulkan::setWaterSun(&sunDirection.x,
+		CTimeCycle::GetSunCoreRed()/255.0f,
+		CTimeCycle::GetSunCoreGreen()/255.0f,
+		CTimeCycle::GetSunCoreBlue()/255.0f);
 	// The vehicle the player sits in, if any: its bonnet is the least
 	// rewarding case a screen-space lookup has -- it mostly finds the car
 	// itself -- so the backend keeps that one car on the panorama layer.

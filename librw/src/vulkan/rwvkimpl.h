@@ -320,6 +320,15 @@ struct Globals
 	float32 carReflectionIntensity;
 	float32 carReflectionSsr;
 	float32 carReflectionSsrDistance;
+	// Modern water state: the player switch, the per-draw water hint from
+	// the game's render commands, ripple time and the glint sun.
+	bool32 modernWater;
+	bool32 im3dWaterDraw;
+	float32 effectsTime;
+	float32 waterSunDirWorld[3];
+	float32 waterSunColour[3];
+	// The seven WATER sliders in SceneData order; see setWaterParams.
+	float32 waterParams[8];
 
 	// First person anchor: the player's head in the game world. anchorYaw is
 	// the world yaw that play-space forward maps to. On foot it is latched at
@@ -424,9 +433,21 @@ struct SceneData
 	// 16x16 screen cells per eye that interface (Im2D) draws touched in the
 	// frame the reflections sample: words 0-7 left eye, 8-15 right eye.
 	uint32 im2dCoverage[16];
-	// x = overall reflection intensity, y = SSR weight inside it; the
-	// player tunes both from the EFFECTS page.
+	// x = overall reflection intensity, y = SSR weight inside it, z = SSR
+	// range in metres, w = game-time seconds for the water ripples.
 	float32 reflectionParams[4];
+	// xyz = direction toward the sun in play space, w = its colour as
+	// RGBA8; the water glint reads it.
+	float32 waterSun[4];
+	// Play space back to game world. The water ripple field must anchor in
+	// world coordinates -- play space moves with the camera -- and the near
+	// water is atomic geometry whose vertex shader only ever sees play
+	// space, so the fragment stage undoes the fold with this.
+	float32 playToWorld[16];
+	// The WATER page sliders as multipliers of the base recipe: waves,
+	// speed, distortion, reflection / sheen, glint, sparks, unused.
+	float32 waterParams1[4];
+	float32 waterParams2[4];
 };
 
 // Mirrors PushConstants in rw_common.glsl. Exactly 128 bytes -- the guaranteed

@@ -16,6 +16,8 @@ layout(set = 3, binding = 0) uniform sampler2D envTexture;
 // that actually stand around it -- the part of "looks like metal" a canned
 // texture cannot provide.
 layout(set = 3, binding = 1) uniform sampler2DArray envScene;
+// The generated water wave normal map; see createWaterNormalTexture.
+layout(set = 3, binding = 2) uniform sampler2D waterNormals;
 
 layout(location = 0) in vec4 fragColour;
 layout(location = 1) in vec2 fragTexCoord;
@@ -191,7 +193,10 @@ void main()
 	// untouched.
 	vec3 fromEye = fragWorldPos - scene.im2dParams.yzw;
 	const float eyeDistSq = dot(fromEye, fromEye);
-	if(envBits != 0 && eyeDistSq > 1.21){
+	// The water mask atomic carries MatFX; the water block below is its
+	// reflection, so it must not run this one too.
+	if(envBits != 0 && eyeDistSq > 1.21 &&
+	   (lightBits & 0x1000000) == 0){
 		const float eyeDist = sqrt(eyeDistSq);
 		const float envFade = clamp(eyeDist*1.25 - 1.375, 0.0, 1.0);
 		vec3 reflNormal = normalize(fragNormal);
@@ -270,6 +275,118 @@ void main()
 		env += sun.rgb*pow(glint, 24.0);
 		colour.rgb += env*(envFade*scene.reflectionParams.x*
 		                   float(envBits)*(1.0/63.0));
+	}
+
+	// MODERN WATER, on the draws the game marks as water -- both the far
+	// immediate-mode sectors and the near wavy/mask atomics. The wave
+	// shape comes from the generated normal map, scrolled as two layers in
+	// different directions -- the Half-Life recipe, wired to the previous
+	// frame instead of a second render pass: at grazing angles the water
+	// becomes a Fresnel-weighted mirror of what stood on screen, looking
+	// down it stays Rockstar's water art. Only the flat sky fallback is
+	// kept additive and small -- mixing that one in washed the authored
+	// texture out once already. One integer test when off.
+	if((lightBits & 0x1000000) != 0){
+		const float t = scene.reflectionParams.w*scene.waterParams1.y;
+		// True world coordinates: play space moves with the camera and
+		// waves built from it would race across the sea.
+		const vec2 wp =
+			(scene.playToWorld*vec4(fragWorldPos, 1.0)).xy;
+		// Two layers at different scale, heading and speed; their
+		// disagreement hides the tiling.
+		vec3 layerA = texture(waterNormals,
+			wp*0.061 + t*vec2(0.023, 0.012)).rgb*2.0 - 1.0;
+		vec3 layerB = texture(waterNormals,
+			wp*0.017 - t*vec2(0.008, 0.015)).rgb*2.0 - 1.0;
+		vec2 slope = (layerA.xy + layerB.xy*0.7)*scene.waterParams1.x;
+		// Play space is Y up; the horizontal swap only turns the wave
+		// anisotropy, which the noise hides.
+		vec3 normal = normalize(vec3(slope.x*0.38, 1.0, slope.y*0.38));
+
+		vec3 fromEye = fragWorldPos - scene.im2dParams.yzw;
+		float eyeDist = max(length(fromEye), 0.001);
+		vec3 viewDir = fromEye/eyeDist;
+		vec3 reflected = reflect(viewDir, normal);
+		// A ripple can fold the ray under the surface; a mirror cannot.
+		reflected.y = abs(reflected.y);
+		// The lookup ray leaves the FLAT plane and the waves distort the
+		// fetched picture instead of steering the ray: a building in the
+		// water stays a building with a wobble, where a wave-bent ray
+		// smeared it across whatever stood near the horizon.
+		vec3 mirror = vec3(viewDir.x, max(-viewDir.y, 0.02), viewDir.z);
+
+		float facing = clamp(dot(normal, -viewDir), 0.0, 1.0);
+		float fresnel = pow(1.0 - facing, 5.0);
+
+		// The probe rises a fixed eight metres off the plane whatever
+		// the ray's pitch. A march that grew with distance kept the
+		// probe ON the water across a bay, and the previous frame's
+		// water there holds this block's own output -- the feedback
+		// loop read as marching stripes. Above the waterline it lands
+		// on buildings and sky, which cannot feed back. The lookup
+		// stays MONO -- left matrix, left layer -- like the car block
+		// above, so the eyes cannot disagree.
+		float march = clamp(8.0/max(mirror.y, 0.04), 12.0, 260.0);
+		vec4 clip = scene.reflectionReproject[0]*
+			vec4(fragWorldPos + mirror*march, 1.0);
+		float seenWeight = 0.0;
+		float fade = ReflectionFade(clip);
+		if(fade > 0.0){
+			vec2 uv = clip.xy/clip.w*0.5 + 0.5 +
+				slope*(0.015*scene.waterParams1.z);
+			if(!CoveredByInterface(uv, 0)){
+				// One-texel tent: the reduced copy comes from a
+				// single blit and aliases, and a flat mirror
+				// shows that moire as shimmering stripes.
+				vec2 px = 0.6/vec2(textureSize(envScene, 0).xy);
+				vec3 seen = (textureLod(envScene,
+					vec3(uv + px, 0.0), 0.0).rgb +
+					textureLod(envScene,
+					vec3(uv - px, 0.0), 0.0).rgb +
+					textureLod(envScene, vec3(
+					uv + vec2(px.x, -px.y), 0.0), 0.0).rgb +
+					textureLod(envScene, vec3(
+					uv - vec2(px.x, -px.y), 0.0), 0.0).rgb)*
+					0.25;
+				seenWeight = fade*clamp((fresnel*1.5 + 0.12)*
+					scene.waterParams1.w, 0.0, 1.0);
+				colour.rgb = mix(colour.rgb, seen, seenWeight);
+			}
+		}
+		// Where the lookup has no answer -- screen edges, cells the
+		// interface drew over -- a little sky lands additively instead,
+		// so the mirror does not cut off at the frame border.
+		vec3 sheen = mix(scene.fogColour.rgb, scene.skyColour.rgb,
+		                 clamp(mirror.y*2.0, 0.0, 1.0));
+		colour.rgb += sheen*((1.0 - seenWeight)*(fresnel*0.30 + 0.03)*
+		                     scene.waterParams2.x);
+
+		vec4 sunColour =
+			unpackUnorm4x8(floatBitsToUint(scene.waterSun.w));
+		float glint = pow(max(dot(reflected, scene.waterSun.xyz), 0.0),
+		                  96.0);
+		colour.rgb += sunColour.rgb*(glint*1.4*scene.waterParams2.y);
+
+		// The dynamic lights lay their sparks across the waves: a street
+		// lamp or a headlight beside the seafront is what carries the
+		// water at night, when the sky has nothing to offer. Skipped
+		// outright at zero: the slider only scaled the sum, so turning
+		// it off still walked every light on every water pixel.
+		const int waterLights = scene.waterParams2.z > 0.0 ?
+			int(scene.lightCount.x) : 0;
+		vec3 sparks = vec3(0.0);
+		for(int i = 0; i < waterLights; i++){
+			vec3 toLight = scene.lightPosRad[i].xyz - fragWorldPos;
+			float lightDist = length(toLight);
+			float reach = scene.lightPosRad[i].w*2.0;
+			if(lightDist >= reach || lightDist <= 0.0)
+				continue;
+			float spark = pow(max(dot(reflected, toLight/lightDist), 0.0),
+			                  64.0);
+			sparks += scene.lightColour[i].rgb*
+				(spark*(1.0 - lightDist/reach)*1.5);
+		}
+		colour.rgb += sparks*scene.waterParams2.z;
 	}
 
 	colour.rgb = mix(scene.fogColour.rgb, colour.rgb, fragFog);

@@ -11,6 +11,7 @@ void setImmediate2DStrictDepth(bool32 enabled);
 #ifdef RW_VULKAN
 namespace rw { namespace vulkan {
 void setImmediate2DStrictDepth(bool32 enabled);
+void setIm3DWater(bool32 water);
 } }
 #endif
 
@@ -30,8 +31,19 @@ public:
 
 	void DrawAtomic(const AtomicDrawCommand &command)
 	{
-		if(command.atomic)
+		if(command.atomic){
+#ifdef RW_VULKAN
+			// The near water is not immediate-mode at all: the wavy and
+			// mask patches are atomics. Without this hint the modern-water
+			// path only ever touched the far flat sectors.
+			rw::vulkan::setIm3DWater(
+				command.role == OBJECT_DRAW_WATER);
+#endif
 			RpAtomicRender(command.atomic);
+#ifdef RW_VULKAN
+			rw::vulkan::setIm3DWater(0);
+#endif
+		}
 	}
 
 	void DrawClump(const ClumpDrawCommand &command)
@@ -42,8 +54,22 @@ public:
 
 	bool BeginImmediate3D(const Immediate3DBeginCommand &command)
 	{
-		return RwIm3DTransform(command.vertices, command.vertexCount,
-			command.transform, command.flags) != nil;
+#ifdef RW_VULKAN
+		// The backend's modern-water path needs to know which immediate
+		// draws ARE the water; the role already says so.
+		rw::vulkan::setIm3DWater(
+			command.role == IMMEDIATE3D_DRAW_WATER);
+#endif
+		const bool began = RwIm3DTransform(command.vertices,
+			command.vertexCount, command.transform,
+			command.flags) != nil;
+#ifdef RW_VULKAN
+		// A refused transform means EndImmediate3D never runs, so the
+		// hint would stay set and colour whatever drew next as water.
+		if(!began)
+			rw::vulkan::setIm3DWater(0);
+#endif
+		return began;
 	}
 
 	bool DrawImmediate3DIndexed(const Immediate3DIndexedCommand &command)
@@ -60,6 +86,9 @@ public:
 	void EndImmediate3D(void)
 	{
 		RwIm3DEnd();
+#ifdef RW_VULKAN
+		rw::vulkan::setIm3DWater(0);
+#endif
 	}
 
 	bool DrawImmediate2D(const Immediate2DCommand &command)

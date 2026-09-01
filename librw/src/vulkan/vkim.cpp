@@ -144,9 +144,13 @@ setupCommonState(VkCommandBuffer commandBuffer, uint32 shader,
 	push.surfaceProps[1] = 0.0f;	// immediate geometry is never lit
 	// The strict radar pass is pinned to the near depth plane. This keeps the
 	// map visible through a vehicle cockpit while preserving the original
-	// equal-depth circular mask.
-	push.surfaceProps[2] =
-		shader == SHADER_IM2D && gImmediate2DStrictDepth ? 1.0f : 0.0f;
+	// equal-depth circular mask. For Im3D the slot instead carries the
+	// modern-water bit the fragment shader's water block keys off.
+	if(shader == SHADER_IM2D)
+		push.surfaceProps[2] = gImmediate2DStrictDepth ? 1.0f : 0.0f;
+	else
+		push.surfaceProps[2] = gvk.modernWater && gvk.im3dWaterDraw ?
+			(float32)0x1000000u : 0.0f;
 	push.surfaceProps[3] = gstate.alphaTestRef / 255.0f;
 	vkCmdPushConstants(commandBuffer, getPipelineLayout(),
 	                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,

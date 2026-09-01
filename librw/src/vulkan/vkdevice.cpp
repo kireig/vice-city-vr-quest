@@ -473,12 +473,11 @@ createSceneColour(FrameContext &frame)
 }
 
 // How far down the finished frame is taken before the reflection block
-// samples it, when the player has not chosen. Four costs a blit and a
-// sixteenth of the memory, and a reflection on car paint loses nothing
-// it was showing -- but it does not buy frame time either, which is the
-// whole reason it was tried. Left at four because the softer reflection
-// is the better-looking of two equals.
-enum { SCENE_REFLECTION_DIVISOR = 4 };
+// samples it, when the player has not chosen. One reads the frame
+// itself and needs no copy at all, which is the default: reducing it
+// was tried against the frame time and bought nothing, and the water
+// mirror is the sharper for reading the full picture.
+enum { SCENE_REFLECTION_DIVISOR = 1 };
 
 // Decides how big the reduced copy is and whether it can be produced at all.
 // A format that cannot be blitted with a linear filter leaves the reflection
@@ -590,7 +589,7 @@ createSceneReflection(FrameContext &frame)
 static bool32
 reduceSceneForReflection(FrameContext &frame)
 {
-	if(!gvk.carReflections || !gvk.sceneReflectionBlit ||
+	if((!gvk.carReflections && !gvk.modernWater) || !gvk.sceneReflectionBlit ||
 	   frame.sceneReflectionImage == VK_NULL_HANDLE)
 		return 0;
 
@@ -2311,7 +2310,11 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 	scene->reflectionParams[0] = gvk.carReflectionIntensity;
 	scene->reflectionParams[1] = gvk.carReflectionSsr;
 	scene->reflectionParams[2] = gvk.carReflectionSsrDistance;
-	scene->reflectionParams[3] = 0.0f;
+	scene->reflectionParams[3] = gvk.effectsTime;
+	memcpy(scene->waterParams1, gvk.waterParams,
+	       sizeof(scene->waterParams1));
+	memcpy(scene->waterParams2, gvk.waterParams+4,
+	       sizeof(scene->waterParams2));
 	// Under the previous frame's camera fold for now; the first beginUpdate of
 	// this frame re-derives them under the real one.
 	refreshScenePointLights();
@@ -2856,6 +2859,50 @@ setCarReflectionsEnabled(bool32 enabled)
 }
 
 void
+setModernWaterEnabled(bool32 enabled)
+{
+	gvk.modernWater = enabled;
+}
+
+void
+setIm3DWater(bool32 water)
+{
+	gvk.im3dWaterDraw = water;
+}
+
+void
+setWaterParams(float32 waves, float32 speed, float32 distortion,
+               float32 reflection, float32 sheen, float32 glint,
+               float32 sparks)
+{
+	gvk.waterParams[0] = waves > 0.0f ? waves : 0.0f;
+	gvk.waterParams[1] = speed > 0.0f ? speed : 0.0f;
+	gvk.waterParams[2] = distortion > 0.0f ? distortion : 0.0f;
+	gvk.waterParams[3] = reflection > 0.0f ? reflection : 0.0f;
+	gvk.waterParams[4] = sheen > 0.0f ? sheen : 0.0f;
+	gvk.waterParams[5] = glint > 0.0f ? glint : 0.0f;
+	gvk.waterParams[6] = sparks > 0.0f ? sparks : 0.0f;
+}
+
+void
+setEffectsTime(float32 seconds)
+{
+	gvk.effectsTime = seconds;
+}
+
+void
+setWaterSun(const float32 directionWorld[3], float32 red, float32 green,
+            float32 blue)
+{
+	if(directionWorld != nil)
+		memcpy(gvk.waterSunDirWorld, directionWorld,
+		       sizeof(gvk.waterSunDirWorld));
+	gvk.waterSunColour[0] = red;
+	gvk.waterSunColour[1] = green;
+	gvk.waterSunColour[2] = blue;
+}
+
+void
 setCarReflectionParams(float32 intensity, float32 ssrStrength,
                        float32 ssrDistance)
 {
@@ -2908,6 +2955,25 @@ refreshScenePointLights(void)
 	}
 	scene->lightCount[0] = (float32)count;
 	scene->lightCount[1] = gvk.pointLightGlowStrength;
+
+	// The water glint's sun rides the same fold as everything else.
+	const float32 sx = gvk.waterSunDirWorld[0];
+	const float32 sy = gvk.waterSunDirWorld[1];
+	const float32 sz = gvk.waterSunDirWorld[2];
+	scene->waterSun[0] = m[0]*sx + m[4]*sy + m[8]*sz;
+	scene->waterSun[1] = m[1]*sx + m[5]*sy + m[9]*sz;
+	scene->waterSun[2] = m[2]*sx + m[6]*sy + m[10]*sz;
+	uint32 sunPacked =
+		(uint32)(gvk.waterSunColour[0] < 0.0f ? 0.0f :
+		         gvk.waterSunColour[0] > 1.0f ? 255.0f :
+		         gvk.waterSunColour[0]*255.0f) |
+		(uint32)(gvk.waterSunColour[1] < 0.0f ? 0.0f :
+		         gvk.waterSunColour[1] > 1.0f ? 255.0f :
+		         gvk.waterSunColour[1]*255.0f) << 8 |
+		(uint32)(gvk.waterSunColour[2] < 0.0f ? 0.0f :
+		         gvk.waterSunColour[2] > 1.0f ? 255.0f :
+		         gvk.waterSunColour[2]*255.0f) << 16 | 0xFF000000u;
+	memcpy(&scene->waterSun[3], &sunPacked, sizeof(sunPacked));
 }
 
 // A reflection probe lives in THIS frame's play space, but the image it is
@@ -2933,6 +2999,8 @@ refreshSceneReprojection(void)
 	playToWorld[13] = -(m[4]*m[12] + m[5]*m[13] + m[6]*m[14]);
 	playToWorld[14] = -(m[8]*m[12] + m[9]*m[13] + m[10]*m[14]);
 	playToWorld[15] = 1.0f;
+	// The water ripple field reads it to anchor waves in the world.
+	memcpy(scene->playToWorld, playToWorld, sizeof(playToWorld));
 
 	// Before the first frame is submitted there is no captured fold; using
 	// the current one degrades to a plain previous-view projection.

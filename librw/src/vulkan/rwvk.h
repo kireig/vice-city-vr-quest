@@ -441,6 +441,26 @@ void setCarReflectionsEnabled(bool32 enabled);
 // eye, fading to the panorama past it; pass something huge for no limit.
 void setCarReflectionParams(float32 intensity, float32 ssrStrength,
                             float32 ssrDistance);
+// Modern water: per-pixel ripples, Fresnel, the same previous-frame
+// reflection the cars use, and a sun glint, on the water immediate-mode
+// draws. The game marks those draws through setIm3DWater (driven by the
+// port's render-command role) and the whole effect costs one integer test
+// per pixel when disabled.
+void setModernWaterEnabled(bool32 enabled);
+void setIm3DWater(bool32 water);
+// The WATER settings page, as multipliers of the shader's base recipe:
+// wave steepness, scroll speed, how far the ripples distort the mirrored
+// picture, the mirror's strength, the flat-sky fallback, and the sun and
+// dynamic-light speculars. 1.0 everywhere is the baseline.
+void setWaterParams(float32 waves, float32 speed, float32 distortion,
+                    float32 reflection, float32 sheen, float32 glint,
+                    float32 sparks);
+// Game-time seconds for the ripple animation -- game time, so water freezes
+// with the pause menu -- and the sun the glint reflects, world space with a
+// 0-255 colour.
+void setEffectsTime(float32 seconds);
+void setWaterSun(const float32 directionWorld[3], float32 red, float32 green,
+                 float32 blue);
 // The vehicle the player currently occupies, world space, with its model
 // bounding radius. Its atomics keep the panorama reflection layer only:
 // from the driver's seat a screen-space lookup mostly finds the car itself,
