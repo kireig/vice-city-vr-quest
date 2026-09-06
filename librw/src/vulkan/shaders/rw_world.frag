@@ -80,6 +80,7 @@ void main()
 	// the CPU: surfaceProps.z packs the surface mask in bits 0-7, the air-glow
 	// mask in bits 8-15 and a real-normals flag in bit 16, so the draws away
 	// from every light -- most of a frame -- skip everything here.
+	if(RW_WORLD_EFFECTS != 0){
 	const int lightBits = int(push.surfaceProps.z);
 	const int surfaceMask = lightBits & 0xFF;
 	const int glowMask = (lightBits >> 8) & 0xFF;
@@ -191,12 +192,13 @@ void main()
 	// Fading in between 1.1m and 1.9m from the eye turns the dashboard and
 	// windscreen off outright, keeps the bonnet, and leaves every other car
 	// untouched.
-	vec3 fromEye = fragWorldPos - scene.im2dParams.yzw;
-	const float eyeDistSq = dot(fromEye, fromEye);
 	// The water mask atomic carries MatFX; the water block below is its
 	// reflection, so it must not run this one too.
-	if(envBits != 0 && eyeDistSq > 1.21 &&
+	if(envBits != 0 && scene.reflectionParams.x > 0.0 &&
 	   (lightBits & 0x1000000) == 0){
+		vec3 fromEye = fragWorldPos - scene.im2dParams.yzw;
+		const float eyeDistSq = dot(fromEye, fromEye);
+		if(eyeDistSq > 1.21){
 		const float eyeDist = sqrt(eyeDistSq);
 		const float envFade = clamp(eyeDist*1.25 - 1.375, 0.0, 1.0);
 		vec3 reflNormal = normalize(fragNormal);
@@ -236,6 +238,7 @@ void main()
 		// seat the screen-space lookup mostly finds the car itself, and the
 		// cockpit magnifies every artefact of the technique. Bit 23 comes
 		// from the CPU, which knows which car is occupied.
+		if((lightBits & 0x800000) == 0 && scene.reflectionParams.y > 0.0){
 		float march = 10.0 + reflected.y*(reflected.y > 0.0 ? 18.0 : 7.0);
 		vec4 probe = vec4(fragWorldPos + reflected*march, 1.0);
 		// The lookup is MONO: both eyes project through the left eye's
@@ -251,9 +254,7 @@ void main()
 		// strength does. What this block spends goes on the arithmetic
 		// around it, per pixel of bodywork on screen.
 		vec4 clip = scene.reflectionReproject[0]*probe;
-		float fade = ((lightBits & 0x800000) != 0 ||
-		              scene.reflectionParams.y <= 0.0) ?
-			0.0 : ReflectionFade(clip);
+		float fade = ReflectionFade(clip);
 		// The player-set SSR range: past it the car eases onto the
 		// panorama over four metres instead of cutting.
 		fade *= clamp((scene.reflectionParams.z - eyeDist)*0.25,
@@ -270,11 +271,13 @@ void main()
 			}
 		}
 
+		}
 		vec4 sun = unpackUnorm4x8(floatBitsToUint(push.lightDirColour.w));
 		float glint = max(dot(reflected, -push.lightDirColour.xyz), 0.0);
 		env += sun.rgb*pow(glint, 24.0);
 		colour.rgb += env*(envFade*scene.reflectionParams.x*
 		                   float(envBits)*(1.0/63.0));
+		}
 	}
 
 	// MODERN WATER, on the draws the game marks as water -- both the far
@@ -326,10 +329,11 @@ void main()
 		// on buildings and sky, which cannot feed back. The lookup
 		// stays MONO -- left matrix, left layer -- like the car block
 		// above, so the eyes cannot disagree.
+		float seenWeight = 0.0;
+		if(scene.waterParams1.w > 0.0){
 		float march = clamp(8.0/max(mirror.y, 0.04), 12.0, 260.0);
 		vec4 clip = scene.reflectionReproject[0]*
 			vec4(fragWorldPos + mirror*march, 1.0);
-		float seenWeight = 0.0;
 		float fade = ReflectionFade(clip);
 		if(fade > 0.0){
 			vec2 uv = clip.xy/clip.w*0.5 + 0.5 +
@@ -353,6 +357,7 @@ void main()
 				colour.rgb = mix(colour.rgb, seen, seenWeight);
 			}
 		}
+		}
 		// Where the lookup has no answer -- screen edges, cells the
 		// interface drew over -- a little sky lands additively instead,
 		// so the mirror does not cut off at the frame border.
@@ -361,11 +366,13 @@ void main()
 		colour.rgb += sheen*((1.0 - seenWeight)*(fresnel*0.30 + 0.03)*
 		                     scene.waterParams2.x);
 
+		if(scene.waterParams2.y > 0.0){
 		vec4 sunColour =
 			unpackUnorm4x8(floatBitsToUint(scene.waterSun.w));
 		float glint = pow(max(dot(reflected, scene.waterSun.xyz), 0.0),
 		                  96.0);
 		colour.rgb += sunColour.rgb*(glint*1.4*scene.waterParams2.y);
+		}
 
 		// The dynamic lights lay their sparks across the waves: a street
 		// lamp or a headlight beside the seafront is what carries the
@@ -389,6 +396,7 @@ void main()
 		colour.rgb += sparks*scene.waterParams2.z;
 	}
 
+	}
 	colour.rgb = mix(scene.fogColour.rgb, colour.rgb, fragFog);
 	outColour = colour;
 	// Compact dynamic-vector transport. The post pass divides by the same gain.

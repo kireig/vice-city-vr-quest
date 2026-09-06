@@ -10,6 +10,8 @@
 // Must match RW_MAX_BONES in rwvkimpl.h: RenderWare's own ceiling.
 #define RW_MAX_BONES 64
 
+layout(constant_id = 1) const int RW_WORLD_EFFECTS = 0;
+
 layout(set = 0, binding = 0) uniform SceneData {
 	// Indexed by gl_ViewIndex. Both entries hold the same matrix in mono.
 	// Play space (OpenXR, metres, Y up) to clip.

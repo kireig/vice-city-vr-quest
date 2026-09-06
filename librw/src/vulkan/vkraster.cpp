@@ -17,6 +17,7 @@
 #include <android/log.h>
 #define VKLOG(...) __android_log_print(ANDROID_LOG_INFO, "librw-vk", __VA_ARGS__)
 #include <time.h>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -74,7 +75,7 @@ static uint32 gMipSeen, gMipMade, gMipOffFlag, gMipNotTexture,
 	gMipTooSmall, gMipBadFormat;
 // Total time spent filtering and re-encoding, so the cost of this is a
 // number rather than an impression.
-static uint64 gMipMicroseconds;
+static std::atomic<uint64> gMipMicroseconds(0);
 static uint8 *gMipScratch[2];
 static size_t gMipScratchBytes;
 static uint8 *gMipMask;
@@ -102,7 +103,7 @@ reportGeneratedMips(void)
 	      "flag %u type %u size %u large %u format %u | landed %u "
 	      "promoted %u",
 	      gMipSeen, gMipMade,
-	      (unsigned long long)(gMipMicroseconds/1000ull),
+	      (unsigned long long)(gMipMicroseconds.load(std::memory_order_relaxed)/1000ull),
 	      gMipOffFlag, gMipNotTexture, gMipTooSmall, gMipTooLarge,
 	      gMipBadFormat, gMipLanded, gMipPromoted);
 }
@@ -1088,6 +1089,40 @@ freeMipJob(GeneratedMipJob *job)
 	rwFree(job);
 }
 
+// Called with the queue lock held. The worker owns the in-flight buffers
+// until filtering returns; all other jobs can release their copies now.
+static void
+discardGeneratedMipJobs(void)
+{
+	if(gMipInFlight != nil){
+		gMipInFlight->cancelled = true;
+		gMipInFlight->native = nil;
+	}
+	while(!gMipPending.empty()){
+		freeMipJob(gMipPending.front());
+		gMipPending.pop_front();
+	}
+	while(!gMipFinished.empty()){
+		freeMipJob(gMipFinished.front());
+		gMipFinished.pop_front();
+	}
+}
+
+void
+setGenerateMipmaps(bool32 enabled)
+{
+	enabled = enabled != 0;
+	if(gvk.generateMipmaps == enabled)
+		return;
+	if(renderDiagnosticsEnabled())
+		VKLOG("generated mipmaps %s", enabled ? "on" : "off");
+	gvk.generateMipmaps = enabled;
+	if(!enabled){
+		std::lock_guard<std::mutex> lock(gMipMutex);
+		discardGeneratedMipJobs();
+	}
+}
+
 static void
 mipWorkerBody(void)
 {
@@ -1098,7 +1133,7 @@ mipWorkerBody(void)
 			gMipSignal.wait(lock, []{
 				return gMipWorkerStop || !gMipPending.empty();
 			});
-			if(gMipWorkerStop && gMipPending.empty())
+			if(gMipWorkerStop)
 				return;
 			job = gMipPending.front();
 			gMipPending.pop_front();
@@ -1110,15 +1145,16 @@ mipWorkerBody(void)
 			gMipInFlight = job;
 		}
 		const uint64 startedAt = microseconds();
-		buildCompressedMips(job->source, job->result, job->width,
+		const bool32 built = buildCompressedMips(job->source, job->result, job->width,
 			job->height, job->sourceFormat, job->format,
 			job->numLevels);
-		gMipMicroseconds += microseconds()-startedAt;
+		gMipMicroseconds.fetch_add(microseconds()-startedAt,
+			std::memory_order_relaxed);
 		{
 			std::lock_guard<std::mutex> lock(gMipMutex);
 			gMipInFlight = nil;
 			// The raster may have been evicted while this ran.
-			if(job->cancelled || job->native == nil){
+			if(!built || job->cancelled || job->native == nil){
 				freeMipJob(job);
 				continue;
 			}
@@ -1133,20 +1169,22 @@ static void
 cancelGeneratedMips(VulkanRaster *native)
 {
 	std::lock_guard<std::mutex> lock(gMipMutex);
-	for(size_t i = 0; i < gMipPending.size(); i++)
-		if(gMipPending[i]->native == native){
-			gMipPending[i]->cancelled = true;
-			gMipPending[i]->native = nil;
-		}
+	for(auto job = gMipPending.begin(); job != gMipPending.end(); )
+		if((*job)->native == native){
+			freeMipJob(*job);
+			job = gMipPending.erase(job);
+		}else
+			++job;
 	if(gMipInFlight != nil && gMipInFlight->native == native){
 		gMipInFlight->cancelled = true;
 		gMipInFlight->native = nil;
 	}
-	for(size_t i = 0; i < gMipFinished.size(); i++)
-		if(gMipFinished[i]->native == native){
-			gMipFinished[i]->cancelled = true;
-			gMipFinished[i]->native = nil;
-		}
+	for(auto job = gMipFinished.begin(); job != gMipFinished.end(); )
+		if((*job)->native == native){
+			freeMipJob(*job);
+			job = gMipFinished.erase(job);
+		}else
+			++job;
 }
 
 static void
@@ -1155,6 +1193,8 @@ queueGeneratedMips(VulkanRaster *native, VkFormat sourceFormat,
                    int32 numLevels, const uint8 *blocks,
                    VkDeviceSize sourceBytes)
 {
+	if(!gvk.generateMipmaps)
+		return;
 	VkDeviceSize resultBytes = 0;
 	for(int32 level = 1; level < numLevels; level++)
 		resultBytes += alignLevel(bcLevelBytes(levelDimension(width, level),
@@ -1204,6 +1244,12 @@ queueGeneratedMips(VulkanRaster *native, VkFormat sourceFormat,
 void
 uploadFinishedMips(void)
 {
+	// Outside a frame endOneShot waits the entire graphics queue. Leave the
+	// completed chains queued until they can inherit a normal frame fence.
+	if(!gvk.generateMipmaps || !gvk.inFrame)
+		return;
+	const VkDeviceSize uploadBudget = 2*1024*1024;
+	VkDeviceSize uploadedBytes = 0;
 	for(int handled = 0; handled < 8; handled++){
 		GeneratedMipJob *job = nil;
 		{
@@ -1211,6 +1257,11 @@ uploadFinishedMips(void)
 			if(gMipFinished.empty())
 				return;
 			job = gMipFinished.front();
+			// A single large chain must still make progress; later chains wait
+			// for the next frame instead of forming a multi-megabyte burst.
+			if(uploadedBytes != 0 &&
+			   job->resultBytes > uploadBudget-uploadedBytes)
+				return;
 			gMipFinished.pop_front();
 		}
 		if(job->cancelled || job->native == nil){
@@ -1229,7 +1280,12 @@ uploadFinishedMips(void)
 			continue;
 		}
 		void *mapped = nil;
-		vkMapMemory(gvk.device, stagingMemory, 0, job->resultBytes, 0, &mapped);
+		if(vkMapMemory(gvk.device, stagingMemory, 0, job->resultBytes,
+		               0, &mapped) != VK_SUCCESS){
+			retireBuffer(staging, stagingMemory);
+			freeMipJob(job);
+			continue;
+		}
 		memcpy(mapped, job->result, (size_t)job->resultBytes);
 		vkUnmapMemory(gvk.device, stagingMemory);
 
@@ -1266,6 +1322,7 @@ uploadFinishedMips(void)
 		                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 		endOneShot(commandBuffer);
+		uploadedBytes += job->resultBytes;
 		native->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 		retireBuffer(staging, stagingMemory);
 
@@ -1289,6 +1346,8 @@ uploadFinishedMips(void)
 			gMipLanded++;
 		}
 		freeMipJob(job);
+		if(uploadedBytes >= uploadBudget)
+			return;
 	}
 }
 
@@ -1300,6 +1359,7 @@ stopGeneratedMips(void)
 		if(!gMipWorkerStarted)
 			return;
 		gMipWorkerStop = true;
+		discardGeneratedMipJobs();
 	}
 	gMipSignal.notify_all();
 	gMipWorker.join();
@@ -1313,14 +1373,7 @@ stopGeneratedMips(void)
 	gMipScratchBytes = 0;
 	gMipMaskBytes = 0;
 	std::lock_guard<std::mutex> lock(gMipMutex);
-	while(!gMipPending.empty()){
-		freeMipJob(gMipPending.front());
-		gMipPending.pop_front();
-	}
-	while(!gMipFinished.empty()){
-		freeMipJob(gMipFinished.front());
-		gMipFinished.pop_front();
-	}
+	discardGeneratedMipJobs();
 }
 
 // Creates a texture directly from DXT blocks, no CPU decode. Adreno 740
@@ -1481,8 +1534,13 @@ rasterFromDXT(int32 width, int32 height, int32 dxt, bool32 hasAlpha,
 		return nil;
 	}
 	uint8 *mapped = nil;
-	vkMapMemory(gvk.device, stagingMemory, 0, stagingSize, 0,
-	            (void**)&mapped);
+	if(vkMapMemory(gvk.device, stagingMemory, 0, stagingSize, 0,
+	               (void**)&mapped) != VK_SUCCESS){
+		vkDestroyBuffer(gvk.device, staging, nil);
+		vkFreeMemory(gvk.device, stagingMemory, nil);
+		raster->destroy();
+		return nil;
+	}
 	if(promote)
 		promoteBc1ToBc3(blocks, (uint32)width, (uint32)height, mapped);
 	else
@@ -1673,7 +1731,8 @@ rasterUnlock(Raster *raster, int32 level)
 		vkCmdCopyBufferToImage(commandBuffer, native->stagingBuffer, native->image,
 		                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-		if(native->generateMips && level == 0 && native->numLevels > 1)
+		if(gvk.generateMipmaps && native->generateMips &&
+		   level == 0 && native->numLevels > 1)
 			uploadGeneratedMips(native, width, height,
 				(uint32)(raster->depth/8), commandBuffer);
 		transitionImageLayout(commandBuffer, native->image,
@@ -1707,7 +1766,7 @@ rasterNumLevels(Raster *raster)
 bool32
 rasterHasGeneratedMips(Raster *raster)
 {
-	return GETVULKANRASTER(raster)->generateMips;
+	return gvk.generateMipmaps && GETVULKANRASTER(raster)->generateMips;
 }
 
 bool32

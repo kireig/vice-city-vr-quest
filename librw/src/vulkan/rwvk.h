@@ -17,6 +17,7 @@ struct EngineOpenParams
 	VkInstance instance;
 	VkPhysicalDevice physicalDevice;
 	VkDevice device;
+	bool32 fragmentStoresAndAtomicsEnabled;
 	uint32 queueFamilyIndex;
 	VkQueue queue;
 

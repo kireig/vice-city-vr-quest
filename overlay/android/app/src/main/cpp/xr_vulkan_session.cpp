@@ -287,6 +287,7 @@ struct State
 	VkInstance vkInstance = VK_NULL_HANDLE;
 	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
+	bool fragmentStoresAndAtomicsEnabled = false;
 	uint32_t queueFamily = 0;
 	VkQueue queue = VK_NULL_HANDLE;
 
@@ -782,6 +783,12 @@ createVulkan(void)
 	multiviewFeatures.multiview = VK_TRUE;
 
 	VkPhysicalDeviceFeatures deviceFeatures = {};
+	VkPhysicalDeviceFeatures availableFeatures = {};
+	vkGetPhysicalDeviceFeatures(g.physicalDevice, &availableFeatures);
+	deviceFeatures.fragmentStoresAndAtomics =
+		availableFeatures.fragmentStoresAndAtomics;
+	g.fragmentStoresAndAtomicsEnabled =
+		deviceFeatures.fragmentStoresAndAtomics != VK_FALSE;
 	deviceFeatures.samplerAnisotropy = VK_TRUE;
 	deviceFeatures.textureCompressionASTC_LDR = VK_TRUE;
 
@@ -2376,6 +2383,7 @@ getContext(GraphicsContext *out)
 	out->instance = g.vkInstance;
 	out->physicalDevice = g.physicalDevice;
 	out->device = g.device;
+	out->fragmentStoresAndAtomicsEnabled = g.fragmentStoresAndAtomicsEnabled;
 	out->queue = g.queue;
 	out->queueFamilyIndex = g.queueFamily;
 	out->width = g.renderWidth;

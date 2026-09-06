@@ -34,6 +34,9 @@ static const uint32_t kIm2DVertSpv[] =
 static const uint32_t kIm2DFragSpv[] =
 #include "rw_im2d_frag.h"
 ;
+static const uint32_t kIm2DNoCoverageFragSpv[] =
+#include "rw_im2d_nocoverage_frag.h"
+;
 static const uint32_t kIm3DVertSpv[] =
 #include "rw_im3d_vert.h"
 ;
@@ -101,6 +104,7 @@ struct State
 	uint32 activeFrame;
 
 	VkShaderModule modules[SHADER_COUNT][2];	// [variant][0=vert,1=frag]
+	VkShaderModule im2dCoverageModule;
 
 	std::vector<PipelineEntry> pipelines;
 	std::vector<PendingPipeline> pending;
@@ -298,6 +302,8 @@ makePipelineKey(uint32 shader, VkPrimitiveTopology topology)
 	key |= (uint64)(gstate.cullMode & 0x3) << 18;
 	key |= (uint64)(alphaTest ? 1 : 0) << 20;
 	key |= (uint64)(strictIm2D ? 1 : 0) << 21;
+	key |= (uint64)(shader != SHADER_IM2D && worldEffectsActive() ? 1 : 0) << 22;
+	key |= (uint64)(shader == SHADER_IM2D && reflectionCoverageActive() ? 1 : 0) << 23;
 	return key;
 }
 
@@ -794,7 +800,13 @@ stateInit(void)
 	gs.modules[SHADER_WORLD][0] = createModule(kWorldVertSpv, sizeof(kWorldVertSpv));
 	gs.modules[SHADER_WORLD][1] = createModule(kWorldFragSpv, sizeof(kWorldFragSpv));
 	gs.modules[SHADER_IM2D][0] = createModule(kIm2DVertSpv, sizeof(kIm2DVertSpv));
-	gs.modules[SHADER_IM2D][1] = createModule(kIm2DFragSpv, sizeof(kIm2DFragSpv));
+	gs.modules[SHADER_IM2D][1] = createModule(kIm2DNoCoverageFragSpv,
+		sizeof(kIm2DNoCoverageFragSpv));
+	if(gvk.fragmentStoresAndAtomicsEnabled){
+		gs.im2dCoverageModule = createModule(kIm2DFragSpv, sizeof(kIm2DFragSpv));
+		if(gs.im2dCoverageModule == VK_NULL_HANDLE)
+			return 0;
+	}
 	gs.modules[SHADER_IM3D][0] = createModule(kIm3DVertSpv, sizeof(kIm3DVertSpv));
 	// im3d reuses the world fragment shader: same texturing, colour and fog.
 	gs.modules[SHADER_IM3D][1] = gs.modules[SHADER_WORLD][1];
@@ -982,6 +994,9 @@ stateShutdown(void)
 	if(gs.envLayout)
 		vkDestroyDescriptorSetLayout(gvk.device, gs.envLayout, nil);
 
+	if(gs.im2dCoverageModule)
+		vkDestroyShaderModule(gvk.device, gs.im2dCoverageModule, nil);
+
 	for(uint32 frame = 0; frame < NUM_FRAME_CONTEXTS; frame++){
 		StateFrame &sf = gs.frames[frame];
 		if(sf.dynamicMapped)
@@ -997,6 +1012,12 @@ stateShutdown(void)
 			vkDestroyBuffer(gvk.device, sf.sceneBuffer, nil);
 		if(sf.sceneMemory)
 			vkFreeMemory(gvk.device, sf.sceneMemory, nil);
+		if(sf.coverageMapped)
+			vkUnmapMemory(gvk.device, sf.coverageMemory);
+		if(sf.coverageBuffer)
+			vkDestroyBuffer(gvk.device, sf.coverageBuffer, nil);
+		if(sf.coverageMemory)
+			vkFreeMemory(gvk.device, sf.coverageMemory, nil);
 	}
 
 	if(gs.descriptorPool) vkDestroyDescriptorPool(gvk.device, gs.descriptorPool, nil);
@@ -1069,13 +1090,27 @@ readAndResetCoverage(uint32 out[16])
 	memset(sf.coverageMapped, 0, 16*sizeof(uint32));
 }
 
-VkPipeline
-getPipeline(uint32 shader, VkPrimitiveTopology topology)
+static VkPipeline
+findEffectsOffFallback(uint64 key)
+{
+	const uint64 effectBits = (uint64(1) << 22) | (uint64(1) << 23);
+	if((key & effectBits) == 0)
+		return VK_NULL_HANDLE;
+	if((key & (uint64(1) << 23)) != 0)
+		gvk.frames[gvk.activeFrame].reflectionCoverageComplete = 0;
+	const uint64 baselineKey = key & ~effectBits;
+	for(size_t i = 0; i < gs.pipelines.size(); i++)
+		if(gs.pipelines[i].key == baselineKey)
+			return gs.pipelines[i].pipeline;
+	return VK_NULL_HANDLE;
+}
+
+static VkPipeline
+getPipelineForKey(uint32 shader, VkPrimitiveTopology topology, uint64 key)
 {
 	if(!gs.initialised || shader >= SHADER_COUNT)
 		return VK_NULL_HANDLE;
 
-	const uint64 key = makePipelineKey(shader, topology);
 	if(gs.lastPipelineValid && gs.lastPipelineKey == key)
 		return gs.lastPipeline;
 
@@ -1102,14 +1137,14 @@ getPipeline(uint32 shader, VkPrimitiveTopology topology)
 	if(gvk.inFrame){
 		for(size_t i = 0; i < gs.pending.size(); i++)
 			if(gs.pending[i].key == key)
-				return VK_NULL_HANDLE;
+				return findEffectsOffFallback(key);
 		PendingPipeline pending;
 		pending.key = key;
 		pending.shader = shader;
 		pending.topology = topology;
 		pending.state = gstate;
 		gs.pending.push_back(pending);
-		return VK_NULL_HANDLE;
+		return findEffectsOffFallback(key);
 	}
 
 	VK_CHECKPOINT("vk/createPipeline");
@@ -1118,22 +1153,28 @@ getPipeline(uint32 shader, VkPrimitiveTopology topology)
 	      (unsigned long long)key);
 
 	const bool32 alphaTest = gstate.alphaTestFunction != ALPHAALWAYS;
-	const int32 alphaTestConstant = alphaTest ? 1 : 0;
-	VkSpecializationMapEntry specEntry = { 0, 0, sizeof(int32) };
+	const int32 constants[2] = { alphaTest ? 1 : 0,
+		(key & (uint64(1) << 22)) != 0 ? 1 : 0 };
+	VkSpecializationMapEntry specEntries[2] = {
+		{ 0, 0, sizeof(int32) }, { 1, sizeof(int32), sizeof(int32) }
+	};
 	VkSpecializationInfo specInfo = {};
-	specInfo.mapEntryCount = 1;
-	specInfo.pMapEntries = &specEntry;
-	specInfo.dataSize = sizeof(int32);
-	specInfo.pData = &alphaTestConstant;
+	specInfo.mapEntryCount = 2;
+	specInfo.pMapEntries = specEntries;
+	specInfo.dataSize = sizeof(constants);
+	specInfo.pData = constants;
 
 	VkPipelineShaderStageCreateInfo stages[2] = {};
 	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
 	stages[0].module = gs.modules[shader][0];
 	stages[0].pName = "main";
+	stages[0].pSpecializationInfo = &specInfo;
 	stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
 	stages[1].module = gs.modules[shader][1];
+	if((key & (uint64(1) << 23)) != 0)
+		stages[1].module = gs.im2dCoverageModule;
 	stages[1].pName = "main";
 	stages[1].pSpecializationInfo = &specInfo;
 
@@ -1233,7 +1274,7 @@ getPipeline(uint32 shader, VkPrimitiveTopology topology)
 	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
 	if(shader == SHADER_IM2D){
-		if(getImmediate2DStrictDepth()){
+		if((key & (uint64(1) << 21)) != 0){
 			// The radar first writes its invisible outside-circle mask, then
 			// draws equal-depth tiles with strict LESS so only the unmasked
 			// circle survives.
@@ -1328,6 +1369,12 @@ getPipeline(uint32 shader, VkPrimitiveTopology topology)
 	return entry.pipeline;
 }
 
+VkPipeline
+getPipeline(uint32 shader, VkPrimitiveTopology topology)
+{
+	return getPipelineForKey(shader, topology, makePipelineKey(shader, topology));
+}
+
 void
 compilePendingPipelines(void)
 {
@@ -1339,7 +1386,7 @@ compilePendingPipelines(void)
 	work.swap(gs.pending);
 	for(size_t i = 0; i < work.size(); i++){
 		gstate = work[i].state;
-		getPipeline(work[i].shader, work[i].topology);
+		getPipelineForKey(work[i].shader, work[i].topology, work[i].key);
 	}
 	gstate = saved;
 }
@@ -1437,6 +1484,8 @@ void
 bindEnvironmentDescriptor(VkCommandBuffer commandBuffer,
                           VkImageView previousScene)
 {
+	if(!worldEffectsActive())
+		return;
 	const VkDescriptorSet set = gs.envDescriptors[gs.activeFrame];
 	if(set == VK_NULL_HANDLE)
 		return;

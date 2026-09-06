@@ -589,7 +589,7 @@ createSceneReflection(FrameContext &frame)
 static bool32
 reduceSceneForReflection(FrameContext &frame)
 {
-	if((!gvk.carReflections && !gvk.modernWater) || !gvk.sceneReflectionBlit ||
+	if(!sceneReflectionsActive() || !gvk.sceneReflectionBlit ||
 	   frame.sceneReflectionImage == VK_NULL_HANDLE)
 		return 0;
 
@@ -2158,6 +2158,7 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 		flushRetired(frameIndex);
 	}
 	gvk.activeFrame = frameIndex;
+	frame.reflectionCoverageComplete = 1;
 	gvk.frameCommands = frame.commandBuffer;
 	setStateFrame(frameIndex);
 
@@ -2308,13 +2309,19 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 	scene->lightCount[2] = (float32)gvk.sceneWidth;
 	scene->lightCount[3] = (float32)gvk.sceneHeight;
 	scene->reflectionParams[0] = gvk.carReflectionIntensity;
-	scene->reflectionParams[1] = gvk.carReflectionSsr;
+	const FrameContext &reflectionPrevious = gvk.frames[
+		(frameIndex + NUM_FRAME_CONTEXTS - 1)%NUM_FRAME_CONTEXTS];
+	const bool32 reflectionHistoryValid = sceneReflectionsActive() &&
+		reflectionPrevious.reflectionHistoryValid;
+	scene->reflectionParams[1] = reflectionHistoryValid ? gvk.carReflectionSsr : 0.0f;
 	scene->reflectionParams[2] = gvk.carReflectionSsrDistance;
 	scene->reflectionParams[3] = gvk.effectsTime;
 	memcpy(scene->waterParams1, gvk.waterParams,
 	       sizeof(scene->waterParams1));
 	memcpy(scene->waterParams2, gvk.waterParams+4,
 	       sizeof(scene->waterParams2));
+	if(!reflectionHistoryValid)
+		scene->waterParams1[3] = 0.0f;
 	// Under the previous frame's camera fold for now; the first beginUpdate of
 	// this frame re-derives them under the real one.
 	refreshScenePointLights();
@@ -2375,10 +2382,9 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 		// there is not -- either the player asked for full resolution
 		// or the colour format cannot be blitted.
 		VkImageView reflectionSource = VK_NULL_HANDLE;
-		if(previous.sceneReflectionInitialised)
+		if(reflectionHistoryValid && previous.sceneReflectionInitialised)
 			reflectionSource = previous.sceneReflectionView;
-		else if(!gvk.sceneReflectionBlit &&
-		        previous.sceneColourInitialised)
+		else if(reflectionHistoryValid && previous.sceneColourInitialised)
 			reflectionSource = previous.sceneColourView;
 		bindEnvironmentDescriptor(gvk.frameCommands, reflectionSource);
 	}
@@ -2412,7 +2418,7 @@ endFrame(void)
 	// for why scene.previousViewProj cannot serve here.
 	memcpy(gvk.reflectionPrevViewProj, gvk.stereoViewProjectionUnjittered,
 	       sizeof(gvk.reflectionPrevViewProj));
-	gvk.reflectionPrevValid = 1;
+	gvk.reflectionPrevValid = sceneReflectionsActive();
 
 	// Make the stored world image visible to the sampled post pass. This is a
 	// full-image dependency rather than BY_REGION because FXAA reads adjacent
@@ -2487,6 +2493,8 @@ endFrame(void)
 	// image as a transfer source, which is a different layout from the
 	// one the post pass wants it in.
 	const bool32 reduced = reduceSceneForReflection(frame);
+	frame.reflectionHistoryValid = sceneReflectionsActive() &&
+		frame.reflectionCoverageComplete;
 	VkImageMemoryBarrier sceneBarrier = {};
 	sceneBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
 	sceneBarrier.srcAccessMask = reduced ? VK_ACCESS_TRANSFER_READ_BIT :
@@ -2930,6 +2938,10 @@ void
 refreshScenePointLights(void)
 {
 	SceneData *scene = getSceneData();
+	scene->lightCount[0] = (float32)gvk.pointLightCount;
+	scene->lightCount[1] = gvk.pointLightGlowStrength;
+	if(gvk.pointLightCount == 0 && !gvk.modernWater)
+		return;
 	const float32 *m = gvk.worldToPlay;
 	const uint32 count = gvk.pointLightCount;
 	for(uint32 i = 0; i < count; i++){
@@ -2985,6 +2997,8 @@ refreshScenePointLights(void)
 void
 refreshSceneReprojection(void)
 {
+	if(!sceneReflectionsActive() && !gvk.modernWater)
+		return;
 	SceneData *scene = getSceneData();
 
 	// The fold is rigid (orthonormal basis, possibly mirrored), so the
@@ -3524,14 +3538,6 @@ renderDiagnosticsEnabled(void)
 }
 
 void
-setGenerateMipmaps(bool32 enabled)
-{
-	if(gvk.generateMipmaps != enabled && gRenderDiagnostics)
-		VKLOG("generated mipmaps %s", enabled ? "on" : "off");
-	gvk.generateMipmaps = enabled;
-}
-
-void
 setSpatialAaMode(uint32 mode)
 {
 	const uint32 accepted = mode ? 1u : 0u;
@@ -3597,7 +3603,7 @@ beginUpdate(Camera *cam)
 	// last camera of the frame wins, exactly as it does for the fold itself.
 	// Outside a frame the GPU may be reading the mapped block right now, and
 	// there is nothing to light anyway.
-	if(gvk.inFrame){
+	if(gvk.inFrame && worldEffectsActive()){
 		refreshScenePointLights();
 		refreshSceneReprojection();
 		uploadSceneData();
@@ -3741,6 +3747,8 @@ deviceSystem(DeviceReq req, void *arg, int32 n)
 		gvk.instance = params->instance;
 		gvk.physicalDevice = params->physicalDevice;
 		gvk.device = params->device;
+		gvk.fragmentStoresAndAtomicsEnabled =
+			params->fragmentStoresAndAtomicsEnabled;
 		gvk.queue = params->queue;
 		gvk.queueFamilyIndex = params->queueFamilyIndex;
 		gvk.width = params->width;

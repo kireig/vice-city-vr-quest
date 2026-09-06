@@ -545,6 +545,8 @@ gameThreadMain(android_app *app, AppState *state)
 			context.instance = graphics.instance;
 			context.physicalDevice = graphics.physicalDevice;
 			context.device = graphics.device;
+			context.fragmentStoresAndAtomicsEnabled =
+				graphics.fragmentStoresAndAtomicsEnabled;
 			context.queue = graphics.queue;
 			context.queueFamilyIndex = graphics.queueFamilyIndex;
 			context.width = graphics.width;

@@ -138,6 +138,8 @@ struct FrameContext
 	VkDeviceMemory sceneReflectionMemory;
 	VkImageView sceneReflectionView;
 	bool32 sceneReflectionInitialised;
+	bool32 reflectionHistoryValid;
+	bool32 reflectionCoverageComplete;
 
 	// V3 temporal history stores the already resolved (but not colour-filtered)
 	// result. It is allocated only for SGSR2_RESOLVED_TEMPORAL_V3.
@@ -233,6 +235,7 @@ struct Globals
 	bool32 initialised;
 	bool32 inFrame;
 	bool32 supportsBC;
+	bool32 fragmentStoresAndAtomicsEnabled;
 	// Off unless the port asks for it: the game's own TXDs decide how
 	// many levels a texture has, and building the rest costs memory.
 	bool32 generateMipmaps;
@@ -355,6 +358,27 @@ struct Globals
 };
 
 extern Globals gvk;
+
+inline bool32 carReflectionsActive(void)
+{
+	return gvk.carReflections && gvk.carReflectionIntensity > 0.0f;
+}
+
+inline bool32 sceneReflectionsActive(void)
+{
+	return (carReflectionsActive() && gvk.carReflectionSsr > 0.0f) ||
+		(gvk.modernWater && gvk.waterParams[3] > 0.0f);
+}
+
+inline bool32 worldEffectsActive(void)
+{
+	return gvk.pointLightCount > 0 || carReflectionsActive() || gvk.modernWater;
+}
+
+inline bool32 reflectionCoverageActive(void)
+{
+	return gvk.fragmentStoresAndAtomicsEnabled && sceneReflectionsActive();
+}
 extern RenderState gstate;
 
 // ---------------------------------------------------------------------------

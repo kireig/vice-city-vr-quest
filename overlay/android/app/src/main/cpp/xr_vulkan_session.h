@@ -69,6 +69,7 @@ struct GraphicsContext
 	VkInstance instance;
 	VkPhysicalDevice physicalDevice;
 	VkDevice device;
+	bool fragmentStoresAndAtomicsEnabled;
 	VkQueue queue;
 	unsigned int queueFamilyIndex;
 	unsigned int width;

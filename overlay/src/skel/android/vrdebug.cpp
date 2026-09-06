@@ -1933,6 +1933,8 @@ VrDebugUpdate(const PadInput &in)
 		   gVrMenuPage == VR_MENU_PAGE_VEHICLE_CALIBRATION)
 			OculusVR::SetQuestVehicleCalibrationPreview(false);
 		gVrMenuVisible = !gVrMenuVisible;
+		if(gVrMenuVisible)
+			OculusVR::InvalidateQuestWeaponLaserOverrides();
 		gVrMenuPage = VR_MENU_PAGE_SETTINGS;
 		gVrMenuSelection = 0;
 		gVrMenuSelectDown = false;
@@ -1958,6 +1960,8 @@ VrDebugUpdate(const PadInput &in)
 		   gVrMenuPage == VR_MENU_PAGE_VEHICLE_CALIBRATION)
 			OculusVR::SetQuestVehicleCalibrationPreview(false);
 		gVrMenuVisible = !closingCheats;
+		if(gVrMenuVisible)
+			OculusVR::InvalidateQuestWeaponLaserOverrides();
 		gVrMenuPage = VR_MENU_PAGE_CHEATS;
 		gVrCheatSelection = 0;
 		gVrCheatStatusFrames = 0;
@@ -3132,7 +3136,7 @@ DrawQuestGraphicsPage(void)
 		gPs2AlphaTest ? "ON" : "OFF");
 	snprintf(rows[VR_GRAPHICS_MIPMAPS], sizeof(rows[0]),
 		"* GENERATE MIPMAPS  < %s >",
-		gGenerateMipmaps ? "ON (RESTART)" : "OFF");
+		gGenerateMipmaps ? "ON (RESTART)" : "OFF (RESTART)");
 	snprintf(rows[VR_GRAPHICS_FOLIAGE], sizeof(rows[0]),
 		"* FOLIAGE SOFTNESS  < %s >",
 		gFoliageSoftness == 3 ? "1.5 LEVELS" :
@@ -4512,7 +4516,9 @@ VrPushDynamicLights(void)
 	// The vehicle the player sits in, if any: its bonnet is the least
 	// rewarding case a screen-space lookup has -- it mostly finds the car
 	// itself -- so the backend keeps that one car on the panorama layer.
-	CVehicle *playerVehicle = FindPlayerVehicle();
+	const bool carSsrActive = gCarReflections &&
+		gCarReflectionIntensity > 0 && gCarReflectionSsr > 0;
+	CVehicle *playerVehicle = carSsrActive ? FindPlayerVehicle() : nil;
 	if(playerVehicle != nil){
 		const CVector vehiclePosition = playerVehicle->GetPosition();
 		rw::vulkan::setPlayerVehicle(&vehiclePosition.x,

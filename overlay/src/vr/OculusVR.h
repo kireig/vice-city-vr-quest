@@ -10,7 +10,7 @@ class CVehicle;
 
 // Single source of truth for the build name shown to players: the flat main
 // menu, the VR About page and the APK version must never disagree again.
-#define MIAMIVR_VERSION_TEXT "0.5.5"
+#define MIAMIVR_VERSION_TEXT "0.5.5.1"
 
 namespace OculusVR
 {
@@ -300,6 +300,7 @@ int GetQuestCalibrationWeaponType(int hand);
 bool IsTrackedWeaponLaserEnabledForType(int weaponType);
 int GetQuestWeaponLaserOverride(int weaponType);
 void CycleQuestWeaponLaserOverride(int weaponType, int direction);
+void InvalidateQuestWeaponLaserOverrides();
 int GetQuestCalibrationValue(int hand, int weaponType, int item);
 void AdjustQuestCalibrationValue(int hand, int weaponType, int item,
 	int direction);

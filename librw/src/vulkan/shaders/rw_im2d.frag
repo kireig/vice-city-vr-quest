@@ -1,4 +1,7 @@
 #version 450
+#ifndef RW_IM2D_COVERAGE
+#define RW_IM2D_COVERAGE 1
+#endif
 // For gl_ViewIndex: the coverage mask is kept per eye, because the interface
 // plane projects to slightly different screen cells in each.
 #extension GL_EXT_multiview : enable
@@ -14,9 +17,11 @@ layout(set = 1, binding = 0) uniform sampler2D diffuseTexture;
 // a head-locked help box never slides across a car body. Written with
 // atomics from a sparse subset of fragments -- a cell is a sixteenth of
 // the screen wide, so every fourth pixel in each axis still marks them all.
+#if RW_IM2D_COVERAGE
 layout(std430, set = 0, binding = 1) buffer CoverageBuffer {
 	uint bits[16];
 } coverage;
+#endif
 
 layout(location = 0) in vec4 fragColour;
 layout(location = 1) in vec2 fragTexCoord;
@@ -46,6 +51,7 @@ void main()
 	// bright-glyphs-only threshold was tried here and the translucent grey
 	// help box still read clearly as a grey slab on a car body, so the
 	// cut-off only spares pixels too faint to tint anything.
+#if RW_IM2D_COVERAGE
 	const float ghost = colour.a*max(colour.r, max(colour.g, colour.b));
 	if(push.surfaceProps.x < 1.5 && fragWorldSprite < 0.5 &&
 	   ghost > 0.04 &&
@@ -57,4 +63,5 @@ void main()
 		int word = (gl_ViewIndex == 0 ? 0 : 8) + (bit >> 5);
 		atomicOr(coverage.bits[word], 1u << (bit & 31));
 	}
+#endif
 }

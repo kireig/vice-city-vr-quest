@@ -57,8 +57,10 @@ void main()
 	fragTexCoord = inTexCoord;
 	// For the per-pixel dynamic lights; skinned meshes always carry real
 	// normals, so the fragment stage uses this one as it is.
-	fragWorldPos = world.xyz;
-	fragNormal = normal;
+	if(RW_WORLD_EFFECTS != 0){
+		fragWorldPos = world.xyz;
+		fragNormal = normal;
+	}
 
 	// Fog by distance from the eye rather than by depth along the view axis.
 	// Planar depth makes the fog a wall perpendicular to the gaze, and in a

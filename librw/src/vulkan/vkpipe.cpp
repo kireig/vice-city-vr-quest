@@ -523,9 +523,11 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 	// water bit has to travel this path too, not only vkim's.
 	const uint32 waterBit =
 		gvk.modernWater && gvk.im3dWaterDraw ? 0x1000000u : 0u;
-	if(gvk.pointLightCount > 0 || gvk.playerVehicleActive){
+	const bool32 testOwnVehicle = gvk.playerVehicleActive &&
+		carReflectionsActive() && gvk.carReflectionSsr > 0.0f;
+	if(gvk.pointLightCount > 0 || testOwnVehicle){
 		const Sphere *bounds = atomic->getWorldBoundingSphere();
-		if(gvk.playerVehicleActive){
+		if(testOwnVehicle){
 			// Every atomic centre of the occupied vehicle -- doors and
 			// bumpers included -- lies inside its model bounding sphere;
 			// the margin covers the one simulation step between where the
@@ -694,7 +696,7 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 		// env coefficient for the reflection, quantised to 6 bits, and
 		// bit 23 the occupied vehicle, which keeps the panorama layer only.
 		uint32 envBits = 0;
-		if(gvk.carReflections && material != nil &&
+		if(carReflectionsActive() && material != nil &&
 		   (geometry->flags & Geometry::NORMALS)){
 			MatFX *matfx = MatFX::get(material);
 			if(matfx != nil){

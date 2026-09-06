@@ -45,8 +45,10 @@ void main()
 	fragTexCoord = inTexCoord;
 	// For the per-pixel dynamic lights. Prelit world sectors carry a dummy
 	// normal; surfaceProps.z tells the fragment stage whether this one is real.
-	fragWorldPos = world.xyz;
-	fragNormal = normal;
+	if(RW_WORLD_EFFECTS != 0){
+		fragWorldPos = world.xyz;
+		fragNormal = normal;
+	}
 
 	// Fog by distance from the eye rather than by depth along the view axis.
 	// Planar depth makes the fog a wall perpendicular to the gaze, and in a

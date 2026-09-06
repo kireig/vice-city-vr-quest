@@ -54,7 +54,7 @@ function(compile_shader SRC STAGE SYMBOL OUTDIR INCDIR)
 	# uniform block offsets and reads the new buffer at the old addresses.
 	add_custom_command(
 		OUTPUT "${OUT}"
-		COMMAND "${GLSLC}" -fshader-stage=${STAGE} --target-env=vulkan1.1 -O
+		COMMAND "${GLSLC}" -fshader-stage=${STAGE} --target-env=vulkan1.1 -O ${ARGN}
 		        -I "${INCDIR}" -MD -MF "${OUT}.d" -mfmt=c -o "${OUT}" "${SRC}"
 		DEPENDS "${SRC}"
 		DEPFILE "${OUT}.d"
@@ -96,6 +96,11 @@ foreach(SHADER rw_world:vert:vertex rw_world:frag:fragment
 	list(APPEND LIBRW_SPIRV_HEADERS ${SHADER_OUTPUTS})
 endforeach()
 
+set(SHADER_OUTPUTS "")
+compile_shader("${LIBRW_SHADER_DIR}/rw_im2d.frag" fragment
+               "rw_im2d_nocoverage_frag" "${LIBRW_SPIRV_DIR}"
+               "${LIBRW_SHADER_DIR}" -DRW_IM2D_COVERAGE=0)
+list(APPEND LIBRW_SPIRV_HEADERS ${SHADER_OUTPUTS})
 add_custom_target(librw_shaders DEPENDS ${LIBRW_SPIRV_HEADERS})
 
 # ---------------------------------------------------------------------------

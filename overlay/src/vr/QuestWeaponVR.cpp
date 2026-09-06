@@ -487,6 +487,11 @@ static bool gSettingsLoaded;
 static bool gHandsEnabled = true;
 static bool gHolsterHighlights = true;
 static bool gWeaponLaser;
+struct WeaponLaserOverride {
+	bool loaded;
+	int value;
+};
+static WeaponLaserOverride gWeaponLaserOverrides[2][WEAPONTYPE_TOTALWEAPONS];
 static bool gManualReload;
 static bool gScopeAim = true;
 static bool gGripLock;
@@ -578,6 +583,7 @@ LoadSettings()
 {
 	if(gSettingsLoaded)
 		return;
+	InvalidateQuestWeaponLaserOverrides();
 	gHandsEnabled = GetPrivateProfileIntA("VR", "VrHands", 1,
 		kSettingsPath) != 0;
 	gWeaponLaser = GetPrivateProfileIntA("VR", "WeaponLaser", 0,
@@ -634,10 +640,8 @@ ReadCalibrationValue(const char *section, int hand, const char *name,
 // section, so it travels with everything else authored for that weapon.
 // -1 follows the global switch, 0 is off, 1 is on.
 static void
-WeaponLaserSection(int weaponType, char *section, int size)
+WeaponLaserSection(int weaponType, bool modern, char *section, int size)
 {
-	const bool modern = ModelSets::GetActiveForCategory(
-		ModelSets::MODEL_CATEGORY_WEAPONS) == ModelSets::MODEL_SET_MODERN;
 	snprintf(section, size, modern ? "VRWeaponModern_%02d_%s" :
 		"VRWeapon_%02d_%s", weaponType, GetVrWeaponName(weaponType));
 }
@@ -645,24 +649,36 @@ WeaponLaserSection(int weaponType, char *section, int size)
 static int
 ReadWeaponLaserOverride(int weaponType)
 {
-	if(weaponType < 0)
+	if(weaponType < 0 || weaponType >= WEAPONTYPE_TOTALWEAPONS)
 		return -1;
+	const bool modern = ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_WEAPONS) == ModelSets::MODEL_SET_MODERN;
+	WeaponLaserOverride &cached = gWeaponLaserOverrides[modern ? 1 : 0][weaponType];
+	if(cached.loaded)
+		return cached.value;
 	char section[96];
-	WeaponLaserSection(weaponType, section, sizeof(section));
+	WeaponLaserSection(weaponType, modern, section, sizeof(section));
 	const int stored = (int)(int32)GetPrivateProfileIntA(section,
 		"Laser", -1, kSettingsPath);
-	return stored < 0 ? -1 : (stored != 0 ? 1 : 0);
+	cached.value = stored < 0 ? -1 : (stored != 0 ? 1 : 0);
+	cached.loaded = true;
+	return cached.value;
 }
 
 static void
 WriteWeaponLaserOverride(int weaponType, int value)
 {
-	if(weaponType < 0)
+	if(weaponType < 0 || weaponType >= WEAPONTYPE_TOTALWEAPONS)
 		return;
+	const bool modern = ModelSets::GetActiveForCategory(
+		ModelSets::MODEL_CATEGORY_WEAPONS) == ModelSets::MODEL_SET_MODERN;
+	WeaponLaserOverride &cached = gWeaponLaserOverrides[modern ? 1 : 0][weaponType];
 	char section[96], text[16];
-	WeaponLaserSection(weaponType, section, sizeof(section));
+	WeaponLaserSection(weaponType, modern, section, sizeof(section));
 	snprintf(text, sizeof(text), "%d", value);
-	WritePrivateProfileStringA(section, "Laser", text, kSettingsPath);
+	cached.loaded = WritePrivateProfileStringA(section, "Laser", text, kSettingsPath) != 0;
+	if(cached.loaded)
+		cached.value = value < 0 ? -1 : (value != 0 ? 1 : 0);
 }
 
 static bool
@@ -2553,6 +2569,12 @@ bool AreWeaponHolsterHighlightsEnabled()
 }
 bool IsTrackedWeaponLaserEnabled() { LoadSettings(); return gWeaponLaser; }
 
+void
+InvalidateQuestWeaponLaserOverrides()
+{
+	memset(gWeaponLaserOverrides, 0, sizeof(gWeaponLaserOverrides));
+}
+
 // Per weapon, with the page-wide switch as the fallback. A laser earns its
 // place on a pistol and gets in the way on a rifle with iron sights, so the
 // choice belongs to the weapon rather than to the whole loadout.
@@ -3807,6 +3829,7 @@ void ToggleCheatMenu() {}
 void
 PrepareForGameShutdown()
 {
+	InvalidateQuestWeaponLaserOverrides();
 	for(int hand = 0; hand < VR_HAND_COUNT; hand++){
 		gPoseValid[hand] = false;
 		gGrip[hand] = 0.0f;

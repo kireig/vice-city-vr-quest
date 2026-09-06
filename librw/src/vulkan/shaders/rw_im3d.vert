@@ -31,8 +31,10 @@ void main()
 	fragDynamicMotion = gl_ViewIndex == 0 ? rootMotion.xy : rootMotion.zw;
 	fragColour = inColour * push.materialColour;
 	fragTexCoord = inTexCoord;
-	fragWorldPos = world.xyz;
-	fragNormal = vec3(0.0, 0.0, 1.0);
+	if(RW_WORLD_EFFECTS != 0){
+		fragWorldPos = world.xyz;
+		fragNormal = vec3(0.0, 0.0, 1.0);
+	}
 	// Fog by distance from the eye rather than by depth along the view axis.
 	// Planar depth makes the fog a wall perpendicular to the gaze, and in a
 	// headset that wall turns with the head: the mist appears to follow the

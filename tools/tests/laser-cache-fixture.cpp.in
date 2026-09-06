@@ -1,0 +1,130 @@
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
+
+typedef int int32;
+enum { WEAPONTYPE_TOTALWEAPONS = 37 };
+namespace ModelSets {
+enum { MODEL_CATEGORY_WEAPONS, MODEL_SET_CLASSIC, MODEL_SET_MODERN };
+static int active = MODEL_SET_CLASSIC;
+int GetActiveForCategory(int) { return active; }
+}
+
+static const char *kSettingsPath = ".\\vr_settings.ini";
+static bool gWeaponLaser;
+static int profileReads;
+static int profileWrites;
+static bool failWrites;
+static std::map<std::string, int> profile;
+static const char *GetVrWeaponName(int) { return "TEST"; }
+static void LoadSettings() {}
+static int GetPrivateProfileIntA(const char *section, const char *, int fallback, const char *)
+{
+	++profileReads;
+	std::map<std::string, int>::const_iterator found = profile.find(section);
+	return found == profile.end() ? fallback : found->second;
+}
+static int WritePrivateProfileStringA(const char *section, const char *, const char *value, const char *)
+{
+	++profileWrites;
+	if(failWrites)
+		return 0;
+	if(value)
+		profile[section] = std::atoi(value);
+	else
+		profile.erase(section);
+	return 1;
+}
+
+// The runner inserts the actual production declarations and functions here.
+@@PRODUCTION_CACHE@@
+@@PRODUCTION_READ_WRITE@@
+@@PRODUCTION_INVALIDATION@@
+@@PRODUCTION_PUBLIC_API@@
+
+int main()
+{
+	const int weapon = 17;
+	const char *classic = "VRWeapon_17_TEST";
+	const char *modern = "VRWeaponModern_17_TEST";
+	InvalidateQuestWeaponLaserOverrides();
+	assert(!IsTrackedWeaponLaserEnabledForType(weapon));
+	assert(profileReads == 1);
+	for(int frame = 0; frame < 10000; ++frame){
+		assert(!IsTrackedWeaponLaserEnabledForType(weapon));
+		assert(GetQuestWeaponLaserOverride(weapon) == -1);
+	}
+	assert(profileReads == 1);
+
+	gWeaponLaser = true;
+	assert(IsTrackedWeaponLaserEnabledForType(weapon));
+	assert(profileReads == 1);
+	gWeaponLaser = false;
+	CycleQuestWeaponLaserOverride(weapon, 1);
+	assert(profileWrites == 1 && profile[classic] == 0);
+	assert(!IsTrackedWeaponLaserEnabledForType(weapon));
+	CycleQuestWeaponLaserOverride(weapon, 1);
+	assert(profile[classic] == 1 && IsTrackedWeaponLaserEnabledForType(weapon));
+	CycleQuestWeaponLaserOverride(weapon, 1);
+	assert(profile[classic] == -1 && !IsTrackedWeaponLaserEnabledForType(weapon));
+	assert(profileReads == 1);
+	CycleQuestWeaponLaserOverride(weapon, -1);
+	assert(profile[classic] == 1 && IsTrackedWeaponLaserEnabledForType(weapon));
+	assert(profileReads == 1);
+
+	profile[modern] = 0;
+	ModelSets::active = ModelSets::MODEL_SET_MODERN;
+	assert(!IsTrackedWeaponLaserEnabledForType(weapon));
+	assert(profileReads == 2);
+	for(int frame = 0; frame < 10000; ++frame){
+		ModelSets::active = ModelSets::MODEL_SET_CLASSIC;
+		assert(IsTrackedWeaponLaserEnabledForType(weapon));
+		ModelSets::active = ModelSets::MODEL_SET_MODERN;
+		assert(!IsTrackedWeaponLaserEnabledForType(weapon));
+	}
+	assert(profileReads == 2);
+	CycleQuestWeaponLaserOverride(weapon, 1);
+	assert(profile[modern] == 1);
+	assert(IsTrackedWeaponLaserEnabledForType(weapon));
+	ModelSets::active = ModelSets::MODEL_SET_CLASSIC;
+	assert(IsTrackedWeaponLaserEnabledForType(weapon));
+	assert(profileReads == 2);
+
+	// External edit/delete takes effect at the explicit settings reload boundary.
+	profile[classic] = 0;
+	InvalidateQuestWeaponLaserOverrides();
+	assert(!IsTrackedWeaponLaserEnabledForType(weapon));
+	assert(profileReads == 3);
+	profile.erase(classic);
+	gWeaponLaser = true;
+	InvalidateQuestWeaponLaserOverrides();
+	assert(IsTrackedWeaponLaserEnabledForType(weapon));
+	assert(GetQuestWeaponLaserOverride(weapon) == -1 && profileReads == 4);
+
+	// A failed persistent write must not publish an override that was never saved.
+	failWrites = true;
+	CycleQuestWeaponLaserOverride(weapon, 1);
+	assert(IsTrackedWeaponLaserEnabledForType(weapon));
+	assert(GetQuestWeaponLaserOverride(weapon) == -1 && profileReads == 5);
+	failWrites = false;
+	const int beforeInvalid = profileReads;
+	const int writesBeforeInvalid = profileWrites;
+	assert(GetQuestWeaponLaserOverride(-1) == -1);
+	assert(GetQuestWeaponLaserOverride(WEAPONTYPE_TOTALWEAPONS) == -1);
+	CycleQuestWeaponLaserOverride(-1, 1);
+	CycleQuestWeaponLaserOverride(WEAPONTYPE_TOTALWEAPONS, 1);
+	assert(profileReads == beforeInvalid && profileWrites == writesBeforeInvalid);
+
+	profile[classic] = -17;
+	InvalidateQuestWeaponLaserOverrides();
+	assert(GetQuestWeaponLaserOverride(weapon) == -1);
+	profile[classic] = 8;
+	InvalidateQuestWeaponLaserOverrides();
+	assert(GetQuestWeaponLaserOverride(weapon) == 1);
+	std::printf("LASER_CACHE_TEST_PASS warm_frames=20000 repeated_queries=40000 warmup_reads=2 subsequent_reads=0 total_reads=%d writes=%d\n",
+		profileReads, profileWrites);
+	return 0;
+}
