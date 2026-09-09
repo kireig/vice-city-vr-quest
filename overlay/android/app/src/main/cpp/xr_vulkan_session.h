@@ -60,6 +60,11 @@ int getActivePerformanceMode(void);
 // True once the session reached a state in which frames must be submitted.
 bool shouldRender(void);
 
+// True only inside the current immersive game frame with a focused session
+// and freshly tracked position AND orientation. Rendering may deliberately
+// continue with a stale position; that pose must not become a new seat origin.
+bool hasTrackedGameplayHeadPose(void);
+
 // One xrWaitFrame / xrBeginFrame / xrEndFrame cycle.
 void renderFrame(void);
 

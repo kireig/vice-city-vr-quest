@@ -1,0 +1,47 @@
+--- a/src/core/main.cpp
++++ b/src/core/main.cpp
+@@ -1537,6 +1537,7 @@
+ 	CClouds::Render();
+ 	DoRWRenderHorizon();
+ 	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_SKY);
++#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+ 	// The culling visualizer owns the world draw while it is frozen: the
+ 	// latched entities in their debug colours, and nothing else.
+ 	if(VrCullViz::IsActive()){
+@@ -1544,6 +1545,7 @@
+ 		POP_RENDERGROUP();
+ 		return;
+ 	}
++#endif
+ 	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_ROADS);
+ 	CRenderer::RenderRoads();
+ 	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_ROADS);
+--- a/src/render/Renderer.cpp
++++ b/src/render/Renderer.cpp
+@@ -1013,7 +1013,7 @@
+ }
+ #endif
+ 
+-#if defined(GTA_VR_OCULUS) || defined(RW_VULKAN)
++#if (defined(GTA_VR_OCULUS) || defined(RW_VULKAN)) && defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+ // The reason a drawn-list entity would or would not survive the per-eye test,
+ // for the culling visualizer. A read-only twin of ShouldRenderInCurrentView's
+ // RW_VULKAN branch: it must not disturb streaming or LOD state.
+--- a/src/render/Renderer.h
++++ b/src/render/Renderer.h
+@@ -99,6 +99,7 @@
+ 	static void PrepareQuestOcclusionContexts(void);
+ #endif
+ 	static bool ShouldRenderInCurrentView(CEntity *ent);
++#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+ 	// Culling visualizer: the same per-view test decomposed into a reason.
+ 	// 0 = drawn, 1 = frustum-culled, 2 = occluder-culled. Read-only.
+ 	static int32 VrClassifyPerView(CEntity *ent);
+@@ -107,6 +108,7 @@
+ 	static int32 GetNoOfVisibleEntities(void) { return ms_nNoOfVisibleEntities; }
+ 	static CEntity *GetVisibleEntity(int32 i) { return ms_aVisibleEntityPtrs[i]; }
+ 	static const CVector &GetVrViewCameraPosition(void) { return ms_vecCameraPosition; }
++#endif
+ #endif
+ 
+ 	static void Init(void);

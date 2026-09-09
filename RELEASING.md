@@ -7,9 +7,14 @@ release root is this `miamivr-quest` repository only.
 Before a tag or GitHub release:
 
 1. Confirm `git diff --cached --name-only` contains no unexpected staged files.
-2. Confirm the repository contains no APK/AAB/SO/EXE/DLL, signing key,
+2. Confirm the repository contains no APK/AAB/SO/DLL, signing key,
    `release-signing.properties`, game data, save, profiler CSV, log, Modern
    model overlay, `.codex*`, `.claude`, `.agents`, `build`, `dist` or cache.
+   The only permitted EXE is the existing `tools/modelsets/txdcompress.exe`,
+   the Windows build of its adjacent source, described in
+   `tools/modelsets/TOOL_NOTICE.md`. No other executable belongs in the kit.
+   Exclude host-generated test `.inc` files and local iteration reports;
+   preserve authored librw shader/font includes and source regression tests.
 3. Assemble from a clean public `mrxenginner/reVC` `miami` checkout at commit
    `026cd10f3fdbd92c089830e5067c4457c53c1b51` into a new output directory.
 4. Assemble a second time with git's line-ending conversion switched off, which
@@ -25,6 +30,9 @@ Before a tag or GitHub release:
    because of it fails for everyone else. Each hunk must carry the line endings
    of the file it targets as reVC stores it: every reVC source is LF except
    `premake5.lua`, which is CRLF.
+   Compare both freshly assembled trees against the intended release sources,
+   including the complete bundled librw and all overlay files. Do not replace
+   newer source-kit changes with older files from a private build directory.
 5. Build `:app:assembleDebug` from that new assembled tree with the toolchain
    listed in `BUILDING.md`. Do not treat an incremental `qbuild` build as the
    reproducibility test.

@@ -332,6 +332,12 @@ struct Globals
 	float32 waterSunColour[3];
 	// The seven WATER sliders in SceneData order; see setWaterParams.
 	float32 waterParams[8];
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+	// Culling visualizer: the master switch, and the flat colour index the
+	// next world draw is tinted with (1..4, 0 = untinted).
+	bool32 debugVizActive;
+	uint32 debugTint;
+#endif
 
 	// First person anchor: the player's head in the game world. anchorYaw is
 	// the world yaw that play-space forward maps to. On foot it is latched at
@@ -472,6 +478,11 @@ struct SceneData
 	// speed, distortion, reflection / sheen, glint, sparks, unused.
 	float32 waterParams1[4];
 	float32 waterParams2[4];
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+	// Culling visualizer: x != 0 puts every world draw into flat debug
+	// colour, its index carried per draw in surfaceProps.z. Zero in play.
+	float32 vizParams[4];
+#endif
 };
 
 // Mirrors PushConstants in rw_common.glsl. Exactly 128 bytes -- the guaranteed

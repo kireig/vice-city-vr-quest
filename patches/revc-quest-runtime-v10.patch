@@ -1,0 +1,119 @@
+diff --git a/src/core/main.cpp b/src/core/main.cpp
+index 75927c3..1d06d3f 100644
+--- a/src/core/main.cpp
++++ b/src/core/main.cpp
+@@ -24,6 +24,7 @@
+ #include "Draw.h"
+ #include "Sprite2d.h"
+ #include "Renderer.h"
++#include "VrCullViz.h"
+ #include "Occlusion.h"
+ #include "Coronas.h"
+ #include "WaterLevel.h"
+@@ -1536,6 +1537,13 @@ RenderScene(void)
+ 	CClouds::Render();
+ 	DoRWRenderHorizon();
+ 	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_SKY);
++	// The culling visualizer owns the world draw while it is frozen: the
++	// latched entities in their debug colours, and nothing else.
++	if(VrCullViz::IsActive()){
++		VrCullViz::Render();
++		POP_RENDERGROUP();
++		return;
++	}
+ 	QUEST_RENDER_PROFILE_BEGIN(androidgame::QUEST_PROFILER_PHASE_RENDER_ROADS);
+ 	CRenderer::RenderRoads();
+ 	QUEST_RENDER_PROFILE_END(androidgame::QUEST_PROFILER_PHASE_RENDER_ROADS);
+diff --git a/src/render/Renderer.cpp b/src/render/Renderer.cpp
+index 145c007..d526657 100644
+--- a/src/render/Renderer.cpp
++++ b/src/render/Renderer.cpp
+@@ -1013,6 +1013,69 @@ CRenderer::ShouldRenderInCurrentView(CEntity *ent)
+ }
+ #endif
+ 
++#if defined(GTA_VR_OCULUS) || defined(RW_VULKAN)
++// The reason a drawn-list entity would or would not survive the per-eye test,
++// for the culling visualizer. A read-only twin of ShouldRenderInCurrentView's
++// RW_VULKAN branch: it must not disturb streaming or LOD state.
++int32
++CRenderer::VrClassifyPerView(CEntity *ent)
++{
++#ifdef RW_VULKAN
++	if(ent == nil || ent->m_rwObject == nil)
++		return 1;
++	const bool aggressive =
++		ms_nVrOcclusionCullingMode == VR_OCCLUSION_CULLING_AGGRESSIVE;
++	const float radius = ent->GetBoundRadius();
++	const CVector boundCentre = ent->GetBoundCentre();
++	const float angularMarginTangent =
++		ms_nVrOcclusionCullingMode == VR_OCCLUSION_CULLING_SAFE ?
++		0.14054083f : (aggressive ? 0.05240778f : 0.08748866f);
++	bool stereoVisible = true;
++	if(ent->IsBuilding()){
++		CColModel *colModel = CModelInfo::GetModelInfo(
++			ent->GetModelIndex())->GetColModel();
++		if(colModel != nil){
++			const CVector &boxMin = colModel->boundingBox.min;
++			const CVector &boxMax = colModel->boundingBox.max;
++			float worldCorners[8][3];
++			for(int corner = 0; corner < 8; corner++){
++				const CVector local(
++					(corner & 1) ? boxMax.x : boxMin.x,
++					(corner & 2) ? boxMax.y : boxMin.y,
++					(corner & 4) ? boxMax.z : boxMin.z);
++				const CVector world = ent->GetMatrix()*local;
++				worldCorners[corner][0] = world.x;
++				worldCorners[corner][1] = world.y;
++				worldCorners[corner][2] = world.z;
++			}
++			stereoVisible = rw::vulkan::
++				isFirstPersonWorldBoxVisibleInStereo(
++					worldCorners, angularMarginTangent) != 0;
++		}else
++			stereoVisible = rw::vulkan::
++				isFirstPersonWorldSphereVisibleInStereo(
++					&boundCentre.x, radius,
++					angularMarginTangent) != 0;
++	}else
++		stereoVisible = rw::vulkan::
++			isFirstPersonWorldSphereVisibleInStereo(
++				&boundCentre.x, radius, angularMarginTangent) != 0;
++	if(!stereoVisible)
++		return 1;
++	if(!ent->IsBuilding() ||
++	   ms_nVrOcclusionCullingMode == VR_OCCLUSION_CULLING_SAFE)
++		return 0;
++	if(gQuestOcclusionPreparedFrame != CTimer::GetFrameCounter() ||
++	   gQuestOcclusionPreparedMask != 0x3)
++		return 0;
++	return COcclusion::IsEntityOccludedByVolumeStereo(ent,
++		gQuestOcclusionEyePosition, aggressive) ? 2 : 0;
++#else
++	return 0;
++#endif
++}
++#endif
++
+ int32
+ CRenderer::SetupEntityVisibility(CEntity *ent)
+ {
+diff --git a/src/render/Renderer.h b/src/render/Renderer.h
+index 7794fec..42ef6ff 100644
+--- a/src/render/Renderer.h
++++ b/src/render/Renderer.h
+@@ -99,6 +99,14 @@ public:
+ 	static void PrepareQuestOcclusionContexts(void);
+ #endif
+ 	static bool ShouldRenderInCurrentView(CEntity *ent);
++	// Culling visualizer: the same per-view test decomposed into a reason.
++	// 0 = drawn, 1 = frustum-culled, 2 = occluder-culled. Read-only.
++	static int32 VrClassifyPerView(CEntity *ent);
++	// Read access to the frame's drawn-list and scan centre for the
++	// visualizer's snapshot, which lives outside this class.
++	static int32 GetNoOfVisibleEntities(void) { return ms_nNoOfVisibleEntities; }
++	static CEntity *GetVisibleEntity(int32 i) { return ms_aVisibleEntityPtrs[i]; }
++	static const CVector &GetVrViewCameraPosition(void) { return ms_vecCameraPosition; }
+ #endif
+ 
+ 	static void Init(void);

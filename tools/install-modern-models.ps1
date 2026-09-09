@@ -2,7 +2,8 @@
 # Quest. No APK or third-party assets are downloaded by this script.
 [CmdletBinding()]
 param(
-    [string]$ModernDir,
+    [Alias("ModelDir")][string]$ModernDir,
+    [ValidateSet("Modern","Xbox")][string]$Profile="Modern",
     [string]$AndroidSdk,
     [string]$Serial,
     [string]$LogPath = (Join-Path $env:TEMP "ViceCityVR-Install-Modern-Models.log"),
@@ -11,7 +12,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$installerVersion = "0.5.1-models-3"
+$installerVersion = "0.5.6-models-5"
+$profileDirectory=$Profile.ToLowerInvariant()
+$profileRequiredFiles=@("vegetation_models.txt","models/gta3.img","models/gta3.dir","models/generic/wheels.dff","models/generic/wheels.txd")
+$profileHashFiles=@("models/generic/wheels.dff","models/generic/wheels.txd")
+if ($Profile -eq "Xbox") {
+    . (Join-Path $PSScriptRoot "modelsets/xbox-modelset.ps1")
+    $profileRequiredFiles=$XboxOutputFiles+@("BUILD_INFO.txt")
+    $profileHashFiles=$profileRequiredFiles
+}
 $packageName = "com.miamivr.quest"
 $remoteModelSets = "/sdcard/Android/data/$packageName/files/gamedata/modelsets"
 $repoRoot = Split-Path $PSScriptRoot -Parent
@@ -113,13 +122,8 @@ function Test-ModernFolder {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path) -or
         -not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
-    $required = @(
-        "vegetation_models.txt",
-        "models\gta3.img",
-        "models\gta3.dir",
-        "models\generic\wheels.dff",
-        "models\generic\wheels.txd"
-    )
+    if ($Profile -eq "Xbox") { return (Test-XboxOverlay $Path) }
+    $required = $profileRequiredFiles
     foreach ($relative in $required) {
         if (-not (Test-Path -LiteralPath (Join-Path $Path $relative) -PathType Leaf)) {
             return $false
@@ -135,7 +139,7 @@ function Resolve-ModernFolder {
         try {
             Add-Type -AssemblyName System.Windows.Forms
             $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-            $dialog.Description = "Select the generated modelsets\modern folder"
+            $dialog.Description = "Select the generated modelsets\$profileDirectory folder"
             $dialog.ShowNewFolderButton = $false
             if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
                 throw "No Modern model folder was selected."
@@ -152,15 +156,15 @@ function Resolve-ModernFolder {
     $root = [IO.Path]::GetFullPath($Requested.Trim('"'))
     $candidates = @(
         $root,
-        (Join-Path $root "modern"),
-        (Join-Path $root "modelsets\modern")
+        (Join-Path $root $profileDirectory),
+        (Join-Path $root "modelsets\$profileDirectory")
     )
     foreach ($candidate in $candidates) {
         if (Test-ModernFolder -Path $candidate) {
             return (Resolve-Path -LiteralPath $candidate).Path
         }
     }
-    throw "The selected folder is not a generated Modern overlay. Required: vegetation_models.txt, models\gta3.img and models\gta3.dir."
+    throw "The selected folder is not a complete generated $Profile profile. Validation must pass before device transfer."
 }
 
 function Select-QuestDevice {
@@ -198,14 +202,14 @@ function Select-QuestDevice {
 }
 
 try {
-    Write-Host "Vice City VR - Modern model installer ($installerVersion)" -ForegroundColor Green
+    Write-Host "Vice City VR - $Profile model installer ($installerVersion)" -ForegroundColor Green
     Write-Host "This copies a model overlay generated locally by the player; it downloads no model assets."
 
     $modern = Resolve-ModernFolder -Requested $ModernDir
     $script:adb = Find-Adb
     Select-QuestDevice
 
-    Write-Host "Modern folder: $modern"
+    Write-Host "$Profile folder: $modern"
     Write-Host "ADB: $script:adb"
     Write-Host "Quest: $Serial"
 
@@ -225,9 +229,9 @@ try {
         -FailureMessage "Could not stop Vice City VR before copying" -Quiet | Out-Null
 
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $script:stagingRemote = "$remoteModelSets/.modern-incoming-$stamp"
-    $backupRemote = "$remoteModelSets/.modern-backup-$stamp"
-    $finalRemote = "$remoteModelSets/modern"
+    $script:stagingRemote = "$remoteModelSets/.$profileDirectory-incoming-$stamp"
+    $backupRemote = "$remoteModelSets/.$profileDirectory-backup-$stamp"
+    $finalRemote = "$remoteModelSets/$profileDirectory"
 
     Invoke-AdbChecked -Arguments @("shell", "mkdir", "-p", $script:stagingRemote) `
         -FailureMessage "Could not create the temporary Modern directory" -Quiet | Out-Null
@@ -242,7 +246,7 @@ try {
 
     $files = @(Get-ChildItem -LiteralPath $modern -File -Recurse -Force)
     if ($files.Count -eq 0) { throw "The selected Modern folder is empty." }
-    Write-Host "Copying $($files.Count) Modern files into pre-created app storage. This can take several minutes..." -ForegroundColor Cyan
+    Write-Host "Copying $($files.Count) $Profile files into pre-created app storage. This can take several minutes..." -ForegroundColor Cyan
     $fileIndex = 0
     foreach ($file in $files) {
         $fileIndex++
@@ -261,13 +265,13 @@ try {
         }
     }
 
-    foreach ($requiredRemote in @(
-        "$script:stagingRemote/vegetation_models.txt",
-        "$script:stagingRemote/models/gta3.img",
-        "$script:stagingRemote/models/gta3.dir",
-        "$script:stagingRemote/models/generic/wheels.dff",
-        "$script:stagingRemote/models/generic/wheels.txd"
-    )) {
+    # ADB-created directories may be shell-owned 0770. The app needs
+    # read/traverse access before the verified profile is activated.
+    Invoke-AdbChecked -Arguments @("shell", "chmod", "-R", "a+rX", $script:stagingRemote) `
+        -FailureMessage "Could not grant application read access to the copied profile" -Quiet | Out-Null
+
+    foreach ($relative in $profileRequiredFiles) {
+        $requiredRemote="$script:stagingRemote/$relative"
         Invoke-AdbChecked -Arguments @("shell", "test", "-f", $requiredRemote) `
             -FailureMessage "Required copied file is missing: $requiredRemote" -Quiet | Out-Null
     }
@@ -275,7 +279,7 @@ try {
     # White wheels are the characteristic result of a missing/corrupt loose
     # wheel TXD.  Hash the two small wheel assets explicitly; hashing the
     # multi-gigabyte archive here would needlessly extend every installation.
-    foreach ($relative in @("models\generic\wheels.dff", "models\generic\wheels.txd")) {
+    foreach ($relative in $profileHashFiles) {
         $localWheel = Join-Path $modern $relative
         $remoteWheel = "$script:stagingRemote/$($relative.Replace('\', '/'))"
         $localHash = (Get-FileHash -LiteralPath $localWheel -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -313,14 +317,15 @@ try {
 
     Invoke-AdbChecked -Arguments @("shell", "ls", "$finalRemote/models/gta3.img") `
         -FailureMessage "Final Modern archive verification failed" | Out-Null
-    Invoke-AdbChecked -Arguments @("shell", "ls", "$finalRemote/vegetation_models.txt") `
-        -FailureMessage "Final vegetation manifest verification failed" | Out-Null
+    $manifestFile=if ($Profile -eq "Xbox") { "vehicle_models.txt" } else { "vegetation_models.txt" }
+    Invoke-AdbChecked -Arguments @("shell", "ls", "$finalRemote/$manifestFile") `
+        -FailureMessage "Final profile manifest verification failed" | Out-Null
     Invoke-AdbChecked -Arguments @("shell", "am", "force-stop", $packageName) `
         -FailureMessage "Could not leave Vice City VR stopped" -Quiet | Out-Null
 
     Write-Host ""
-    Write-Host "MODERN MODELS INSTALLED." -ForegroundColor Green
-    Write-Host "Fully restart Vice City VR. Default: Modern World/Weapons; Classic Vehicles/Peds/Vegetation."
+    Write-Host "$Profile MODELS INSTALLED." -ForegroundColor Green
+    Write-Host "Select $Profile under VR MENU > SETTINGS > MODEL ASSETS, then fully restart. Saved profile settings were not changed."
     Write-Host "Diagnostic log: $LogPath"
     Stop-DiagnosticLog
     exit 0

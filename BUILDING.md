@@ -175,9 +175,7 @@ android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
 The debug build is signed with your machine's local Android debug key and is
-sufficient for personal sideloading. `assembleRelease` is intentionally
-blocked unless you create a private `android/release-signing.properties` from
-the included example and provide your own keystore. Never commit either file.
+sufficient for personal sideloading. `assembleRelease` requires private signing configuration unless the unsigned build option below is explicitly selected. Never commit signing keys or values.
 
 ## 5. Install without deleting existing data
 
@@ -280,7 +278,45 @@ assets are included in this repository.
 - `ninja: mkdir ... No such file or directory`: use shorter source/output paths.
 - SDK/NDK not found: set `ANDROID_HOME`/`ANDROID_SDK_ROOT` or create
   `android/local.properties` with `sdk.dir=...`.
-- release signing error: build `assembleDebug`; release keys are optional and
-  intentionally private.
+- release signing error: check your private release configuration. A personal
+  debug build uses a different key and cannot update a release-signed app.
 - app exits or stays in theater mode: verify the game-data path and filename
   case, then inspect `adb logcat -s MiamiVR:V librw-vk:V`.
+
+## Release and developer build options
+
+A signed release may read its configuration from outside the source tree using
+MIAMIVR_RELEASE_SIGNING_PROPERTIES. The storeFile path is resolved relative to
+that configuration file. Keep both configuration and keystore private.
+
+For an unsigned release artifact, pass -PmiamivrUnsignedRelease=true to
+:app:assembleRelease and sign the APK separately. Release builds are not
+debuggable. Neither path changes the source-only distribution policy.
+
+The culling inspector and other developer-only diagnostics require the explicit
+-PmiamivrDevTools=true option. It is off by default for both debug and release
+builds; ordinary player graphics settings are independent of it.
+
+## Updating without downloading another source ZIP
+
+Use the root `UPDATE.bat` / `UPDATE.sh` wrapper after the initial installation.
+It uses the same work directory and tool caches as the build wizard. See the
+[update instructions](README.md#updating-an-existing-installation) for Git/ZIP
+behavior, work-directory selection, dry runs and building without installing.
+Updates never launch the game or perform an uninstall fallback.
+
+The default personal debug build retains the original wizard's signing
+identity. For an installation signed with your release key, provide its
+external configuration and select the release variant:
+
+```powershell
+$env:MIAMIVR_RELEASE_SIGNING_PROPERTIES = "C:\Private\miamivr-signing.properties"
+.\UPDATE.bat -Release
+```
+
+```sh
+MIAMIVR_RELEASE_SIGNING_PROPERTIES="$HOME/private/miamivr-signing.properties" ./UPDATE.sh --release
+```
+
+The configuration must reference the same signing key as the installed app.
+Keep it and the keystore outside the source kit.

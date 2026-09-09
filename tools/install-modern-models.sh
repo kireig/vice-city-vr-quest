@@ -6,6 +6,7 @@
 #
 # Arguments:
 #   --modern-dir DIR   / -ModernDir DIR    generated modelsets/modern folder
+#   --profile NAME    / -Profile NAME     modern (default) or xbox
 #   --android-sdk DIR  / -AndroidSdk DIR   Android SDK root
 #   --serial SERIAL    / -Serial SERIAL    Quest USB serial
 #   --log-path PATH    / -LogPath PATH     diagnostic log location
@@ -14,19 +15,22 @@
 set -uo pipefail
 
 MODERN_DIR=""
+PROFILE="modern"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANDROID_SDK=""
 SERIAL=""
 LOG_PATH="${TMPDIR:-/tmp}/ViceCityVR-Install-Modern-Models.log"
 NON_INTERACTIVE=0
 
-INSTALLER_VERSION="0.5.1-models-3"
+INSTALLER_VERSION="0.5.6-models-5"
 PACKAGE_NAME="com.miamivr.quest"
 REMOTE_MODELSETS="/sdcard/Android/data/${PACKAGE_NAME}/files/gamedata/modelsets"
 STAGING_REMOTE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --modern-dir|-ModernDir)    MODERN_DIR="$2"; shift 2 ;;
+    --profile|-Profile) PROFILE="${2,,}"; shift 2 ;;
+    --modern-dir|--model-dir|-ModernDir|-ModelDir) MODERN_DIR="$2"; shift 2 ;;
     --android-sdk|-AndroidSdk)  ANDROID_SDK="$2"; shift 2 ;;
     --serial|-Serial)           SERIAL="$2"; shift 2 ;;
     --log-path|-LogPath)        LOG_PATH="$2"; shift 2 ;;
@@ -38,6 +42,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+case "$PROFILE" in modern|xbox) ;; *) echo 'Profile must be modern or xbox.' >&2; exit 1 ;; esac
+REQUIRED=("vegetation_models.txt" "models/gta3.img" "models/gta3.dir" "models/generic/wheels.dff" "models/generic/wheels.txd")
+HASH_FILES=("models/generic/wheels.dff" "models/generic/wheels.txd")
+if [ "$PROFILE" = xbox ]; then
+  REQUIRED=("models/gta3.img" "models/gta3.dir" "models/coll/vehicles.col" "models/generic/wheels.dff" "models/generic/wheels.txd" "vehicle_models.txt" "BUILD_INFO.txt")
+  HASH_FILES=("${REQUIRED[@]}")
+fi
 LOG_DIR="$(dirname "$LOG_PATH")"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 exec > >(tee "$LOG_PATH") 2>&1
@@ -85,7 +96,10 @@ adb_capture() {
 
 # Plain adb shell (used by die() before ADB is resolved).
 adb_shell() {
-  command -v adb >/dev/null && adb shell "$@"
+  [ -n "${ADB:-}" ] || return 1
+  local args=()
+  if [ -n "$SERIAL" ]; then args+=(-s "$SERIAL"); fi
+  "$ADB" "${args[@]}" shell "$@"
 }
 
 file_sha256() {
@@ -116,8 +130,12 @@ find_adb() {
 test_modern_folder() {
   local path="$1"
   [ -n "$path" ] && [ -d "$path" ] || return 1
+  if [ "$PROFILE" = xbox ]; then
+    python3 "$SCRIPT_DIR/modelsets/xbox-modelset.py" validate --out "$path"
+    return $?
+  fi
   local rel
-  for rel in "vegetation_models.txt" "models/gta3.img" "models/gta3.dir" "models/generic/wheels.dff" "models/generic/wheels.txd"; do
+  for rel in "${REQUIRED[@]}"; do
     [ -f "$path/$rel" ] || return 1
   done
   return 0
@@ -136,7 +154,7 @@ resolve_modern_folder() {
 
   local root
   root="$(realpath -m -- "$requested" 2>/dev/null || printf '%s' "$requested")"
-  local candidates=("$root" "$root/modern" "$root/modelsets/modern")
+  local candidates=("$root" "$root/$PROFILE" "$root/modelsets/$PROFILE")
   local candidate
   for candidate in "${candidates[@]}"; do
     if test_modern_folder "$candidate"; then
@@ -189,11 +207,11 @@ select_quest_device() {
 echo "Vice City VR - Modern model installer ($INSTALLER_VERSION)"
 echo "This copies a model overlay generated locally by the player; it downloads no model assets."
 
-MODERN="$(resolve_modern_folder "$MODERN_DIR")"
-ADB="$(find_adb)"
+MODERN="$(resolve_modern_folder "$MODERN_DIR")" || die "Profile validation failed; no device commands were sent."
+ADB="$(find_adb)" || die "ADB discovery failed; no transfer started."
 select_quest_device
 
-echo "Modern folder: $MODERN"
+echo "$PROFILE folder: $MODERN"
 echo "ADB: $ADB"
 echo "Quest: $SERIAL"
 
@@ -208,9 +226,9 @@ adb_checked_quiet shell content query --uri "content://${PACKAGE_NAME}.saves/slo
 adb_checked_quiet shell am force-stop "$PACKAGE_NAME"
 
 stamp="$(date +%Y%m%d-%H%M%S)"
-STAGING_REMOTE="$REMOTE_MODELSETS/.modern-incoming-$stamp"
-BACKUP_REMOTE="$REMOTE_MODELSETS/.modern-backup-$stamp"
-FINAL_REMOTE="$REMOTE_MODELSETS/modern"
+STAGING_REMOTE="$REMOTE_MODELSETS/.$PROFILE-incoming-$stamp"
+BACKUP_REMOTE="$REMOTE_MODELSETS/.$PROFILE-backup-$stamp"
+FINAL_REMOTE="$REMOTE_MODELSETS/$PROFILE"
 
 adb_checked_quiet shell mkdir -p "$STAGING_REMOTE"
 
@@ -231,7 +249,7 @@ done < <(find "$MODERN" -type f)
 if [ "${#files[@]}" -eq 0 ]; then
   die "The selected Modern folder is empty."
 fi
-echo "Copying ${#files[@]} Modern files into pre-created app storage. This can take several minutes..."
+echo "Copying ${#files[@]} $PROFILE files into pre-created app storage. This can take several minutes..."
 file_index=0
 for file in "${files[@]}"; do
   file_index=$((file_index + 1))
@@ -247,19 +265,18 @@ for file in "${files[@]}"; do
   fi
 done
 
-for required_remote in \
-  "$STAGING_REMOTE/vegetation_models.txt" \
-  "$STAGING_REMOTE/models/gta3.img" \
-  "$STAGING_REMOTE/models/gta3.dir" \
-  "$STAGING_REMOTE/models/generic/wheels.dff" \
-  "$STAGING_REMOTE/models/generic/wheels.txd"; do
-  adb_checked_quiet shell test -f "$required_remote"
+# ADB-created directories may be shell-owned 0770; grant the app
+# read/traverse access before activating the verified profile.
+adb_checked_quiet shell chmod -R a+rX "$STAGING_REMOTE"
+
+for relative in "${REQUIRED[@]}"; do
+  adb_checked_quiet shell test -f "$STAGING_REMOTE/$relative"
 done
 
 # White wheels are the characteristic result of a missing/corrupt loose
 # wheel TXD. Hash the two small wheel assets explicitly; hashing the
 # multi-gigabyte archive here would needlessly extend every installation.
-for relative in "models/generic/wheels.dff" "models/generic/wheels.txd"; do
+for relative in "${HASH_FILES[@]}"; do
   local_wheel="$MODERN/$relative"
   remote_wheel="$STAGING_REMOTE/$relative"
   local_hash="$(file_sha256 "$local_wheel")"
@@ -292,11 +309,11 @@ if [ "$had_existing" -eq 1 ]; then
 fi
 
 adb_checked_quiet shell ls "$FINAL_REMOTE/models/gta3.img"
-adb_checked_quiet shell ls "$FINAL_REMOTE/vegetation_models.txt"
+if [ "$PROFILE" = xbox ]; then adb_checked_quiet shell ls "$FINAL_REMOTE/vehicle_models.txt"; else adb_checked_quiet shell ls "$FINAL_REMOTE/vegetation_models.txt"; fi
 adb_checked_quiet shell am force-stop "$PACKAGE_NAME"
 
 echo ""
-echo "MODERN MODELS INSTALLED."
-echo "Fully restart Vice City VR. Default: Modern World/Weapons; Classic Vehicles/Peds/Vegetation."
+echo "$PROFILE MODELS INSTALLED."
+echo "Select $PROFILE under VR MENU > SETTINGS > MODEL ASSETS, then fully restart. Saved profile settings were not changed."
 echo "Diagnostic log: $LOG_PATH"
 exit 0

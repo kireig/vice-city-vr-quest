@@ -456,6 +456,16 @@ void setIm3DWater(bool32 water);
 void setWaterParams(float32 waves, float32 speed, float32 distortion,
                     float32 reflection, float32 sheen, float32 glint,
                     float32 sparks);
+// Culling visualizer. While active every world draw is replaced by a flat
+// debug colour whose index (1 = visible, 2 = frustum-culled, 3 = occluder-
+// culled, 4 = distance/LOD) the caller sets per entity with setDebugTint.
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+void setDebugVizActive(bool32 active);
+void setDebugTint(uint32 index);
+#else
+inline void setDebugVizActive(bool32) {}
+inline void setDebugTint(uint32) {}
+#endif
 // Game-time seconds for the ripple animation -- game time, so water freezes
 // with the pause menu -- and the sun the glint reflects, world space with a
 // 0-255 colour.

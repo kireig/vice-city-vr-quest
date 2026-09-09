@@ -358,6 +358,7 @@ struct State
 	bool applicationMainThreadRegistered = false;
 
 	FrameRenderer frameRenderer = nullptr;
+	bool headPoseTrackedForFrame = false;
 	bool theaterMode = true;
 	bool theaterAnchorValid = false;
 	XrSpace theaterSpace = XR_NULL_HANDLE;
@@ -2906,9 +2907,16 @@ shouldRender(void)
 	return g.running;
 }
 
+bool
+hasTrackedGameplayHeadPose(void)
+{
+	return g.headPoseTrackedForFrame && !g.theaterMode;
+}
+
 void
 renderFrame(void)
 {
+	g.headPoseTrackedForFrame = false;
 	if(!g.running)
 		return;
 
@@ -3004,6 +3012,12 @@ renderFrame(void)
 			LOGI("view state flags 0x%llx", (unsigned long long)reportedFlags);
 		}
 
+		const XrViewStateFlags trackedHeadFlags =
+			XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT |
+			XR_VIEW_STATE_POSITION_TRACKED_BIT | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
+		g.headPoseTrackedForFrame = XR_SUCCEEDED(located) && viewCount == 2 &&
+			g.sessionState == XR_SESSION_STATE_FOCUSED &&
+			(viewState.viewStateFlags & trackedHeadFlags) == trackedHeadFlags;
 		if(XR_SUCCEEDED(located) &&
 		   (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 &&
 		   (locateControllerPoses(submitSpace,
@@ -3109,6 +3123,7 @@ renderFrame(void)
 		}
 	}
 
+	g.headPoseTrackedForFrame = false;
 	// An empty frame is what makes Horizon OS drop the app back to its "still
 	// running" panel, so say the first few times it happens and why, instead of
 	// letting it pass silently.

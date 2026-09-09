@@ -67,6 +67,54 @@ git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v8.patch" || {
     echo "The runtime v8 patch did not apply after the runtime v7 patch."
     exit 1
 }
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v9.patch" || {
+    echo "The runtime v9 patch did not apply after the runtime v8 patch."
+    exit 1
+}
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v10.patch" || {
+    echo "The runtime v10 patch did not apply after the runtime v9 patch."
+    exit 1
+}
+
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v11.patch" || {
+    echo "The runtime v11 patch did not apply after the runtime v10 patch."
+    exit 1
+}
+
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v12.patch" || {
+    echo "The runtime v12 patch did not apply after the runtime v11 patch."
+    exit 1
+}
+
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v13.patch" || {
+    echo "The runtime v13 patch did not apply after the runtime v12 patch."
+    exit 1
+}
+
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v14.patch" || {
+    echo "The runtime v14 patch did not apply after the runtime v13 patch."
+    exit 1
+}
+
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v15.patch" || {
+    echo "The runtime v15 patch did not apply after the runtime v14 patch."
+    exit 1
+}
+
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v16.patch" || {
+    echo "The runtime v16 patch did not apply after the runtime v15 patch."
+    exit 1
+}
+
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v17.patch" || {
+    echo "The runtime v17 patch did not apply after the runtime v16 patch."
+    exit 1
+}
+
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v18.patch" || {
+    echo "The runtime v18 patch did not apply after the runtime v17 patch."
+    exit 1
+}
 rm -rf "$OUT/.git"
 
 echo "[3/4] Copying the port sources..."

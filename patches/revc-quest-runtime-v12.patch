@@ -1,0 +1,216 @@
+--- a/src/entities/Physical.cpp
++++ b/src/entities/Physical.cpp
+@@ -8,6 +8,7 @@
+ #include "Treadable.h"
+ #include "Vehicle.h"
+ #include "Ped.h"
++#include "VrRagdoll.h"
+ #include "Object.h"
+ #include "Glass.h"
+ #include "ParticleObject.h"
+@@ -2167,13 +2168,21 @@
+ 
+ 				float maxImpulseA = 0.0f;
+ 				float maxImpulseB = 0.0f;
++				int strongestPointA = 0, strongestPointB = 0;
++				// ApplyCollision changes the whole ped's velocity before the native
++				// kill callback. Capture the incoming motion here so a low leg hit
++				// does not become an equal forward launch of every ragdoll joint.
++				const CVector preCollisionMoveA = A->m_vecMoveSpeed;
++				const CVector preCollisionMoveB = B->m_vecMoveSpeed;
++				const CVector preCollisionTurnA = A->m_vecTurnSpeed;
++				const CVector preCollisionTurnB = B->m_vecTurnSpeed;
+ 				if(A->bHasContacted && B->bHasContacted){
+ 					for(i = 0; i < numCollisions; i++){
+ 						if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 							continue;
+ 
+-						if(impulseA > maxImpulseA) maxImpulseA = impulseA;
+-						if(impulseB > maxImpulseB) maxImpulseB = impulseB;
++						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
++						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+ 						if(impulseA > A->m_fDamageImpulse)
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+@@ -2197,8 +2206,8 @@
+ 						if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 							continue;
+ 
+-						if(impulseA > maxImpulseA) maxImpulseA = impulseA;
+-						if(impulseB > maxImpulseB) maxImpulseB = impulseB;
++						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
++						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+ 						if(impulseA > A->m_fDamageImpulse)
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+@@ -2233,8 +2242,8 @@
+ 						if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 							continue;
+ 
+-						if(impulseA > maxImpulseA) maxImpulseA = impulseA;
+-						if(impulseB > maxImpulseB) maxImpulseB = impulseB;
++						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
++						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+ 						if(impulseA > A->m_fDamageImpulse)
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+@@ -2263,8 +2272,8 @@
+ 						if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 							continue;
+ 
+-						if(impulseA > maxImpulseA) maxImpulseA = impulseA;
+-						if(impulseB > maxImpulseB) maxImpulseB = impulseB;
++						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
++						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+ 						if(impulseA > A->m_fDamageImpulse)
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+@@ -2286,10 +2295,20 @@
+ 
+ 				if(B->IsPed() && A->IsVehicle() &&
+ 				   (!Bped->IsPlayer() || B->bHasHitWall && A->m_vecMoveSpeed.MagnitudeSqr() > SQR(0.05f)))
+-					Bped->KillPedWithCar((CVehicle*)A, maxImpulseB);
++					Bped->KillPedWithCar((CVehicle*)A, maxImpulseB,
++						&preCollisionMoveB, &aColPoints[strongestPointB].point, &preCollisionTurnB);
+ 				else if(B->GetModelIndex() == MI_TRAIN && A->IsPed() &&
+ 				  (!Aped->IsPlayer() || A->bHasHitWall))
+-					Aped->KillPedWithCar((CVehicle*)B, maxImpulseA*2.0f);
++					Aped->KillPedWithCar((CVehicle*)B, maxImpulseA*2.0f,
++						&preCollisionMoveA, &aColPoints[strongestPointA].point, &preCollisionTurnA);
++				else if(A->IsPed() && B->IsVehicle() && !Aped->IsPlayer() &&
++					Aped->CharCreatedBy == RANDOM_CHAR && VrRagdoll::IsEnabled() && maxImpulseA > 0.0f &&
++					((CVehicle*)B)->IsCar() && !((CVehicle*)B)->IsRealHeli() &&
++					!((CVehicle*)B)->IsRealPlane())
++					// The opposite processing order used to wait for Ped::ProcessControl,
++					// losing the incoming velocity and precise collision point meanwhile.
++					Aped->KillPedWithCar((CVehicle*)B, maxImpulseA,
++						&preCollisionMoveA, &aColPoints[strongestPointA].point, &preCollisionTurnA);
+ 				else if(B->IsObject() && B->bUsesCollision && A->IsVehicle()){
+ 					// BUG? not impulseA?
+ 					if(Bobj->m_nCollisionDamageEffect && maxImpulseB > 20.0f)
+--- a/src/peds/Ped.h
++++ b/src/peds/Ped.h
+@@ -673,7 +673,9 @@
+ 
+ 	void AddWeaponModel(int id);
+ 	void AimGun(void);
+-	void KillPedWithCar(CVehicle *veh, float impulse);
++	void KillPedWithCar(CVehicle *veh, float impulse,
++		const CVector *preCollisionSpeed = nil, const CVector *contactPoint = nil,
++		const CVector *preCollisionTurn = nil);
+ 	void Say(uint16 audio);
+ 	void Say(uint16 audio, int32 time);
+ 	void SetLookFlag(CEntity* target, bool keepTryingToLook, bool cancelPrevious = false);
+--- a/src/peds/PedFight.cpp
++++ b/src/peds/PedFight.cpp
+@@ -3614,10 +3614,35 @@
+ 	}
+ }
+ 
++static bool
++IsVrVehicleKnockdown(CPed *ped, CVehicle *car, float impulse,
++	const CVector *preCollisionSpeed)
++{
++	// Low bumper contacts can stay below Vice City's canned fall threshold.
++	// Require an actual approaching road-car contact, not walking into a parked
++	// car or an unsupported actor. The solver then decides the resulting pose.
++	if(!preCollisionSpeed || impulse <= 0.0f || !VrRagdoll::IsEnabled() ||
++	   !ped || !car || ped->IsPlayer() || ped->CharCreatedBy != RANDOM_CHAR ||
++	   ped->bInVehicle || ped->bIsInWater || !ped->IsPedInControl() ||
++	   !ped->GetClump() || !car->IsCar() || car->IsRealHeli() || car->IsRealPlane() ||
++	   !car->bUsesCollision || car->bRemoveFromWorld || car->m_fMass <= 0.0f ||
++	   (ped->GetPosition()-TheCamera.GetPosition()).MagnitudeSqr() > 30.0f*30.0f)
++		return false;
++	const CVector offset = ped->GetPosition()-car->GetPosition();
++	const CVector relative = car->m_vecMoveSpeed-*preCollisionSpeed;
++	const float distanceSq = offset.x*offset.x+offset.y*offset.y;
++	const float closing = relative.x*offset.x+relative.y*offset.y;
++	return distanceSq > 0.0001f && closing > 0.0f &&
++		closing*closing > (1.5f/50.0f)*(1.5f/50.0f)*distanceSq;
++}
++
+ void
+-CPed::KillPedWithCar(CVehicle *car, float impulse)
++CPed::KillPedWithCar(CVehicle *car, float impulse,
++	const CVector *preCollisionSpeed, const CVector *contactPoint,
++	const CVector *preCollisionTurn)
+ {
+-	const CVector incomingRagdollSpeed = m_vecMoveSpeed;
++	const CVector incomingRagdollSpeed = preCollisionSpeed ? *preCollisionSpeed : m_vecMoveSpeed;
++	const bool lowSpeedRagdollHit = IsVrVehicleKnockdown(this,car,impulse,preCollisionSpeed);
+ 	CVehicleModelInfo *vehModel;
+ 	CColModel *vehColModel;
+ 	uint8 damageDir;
+@@ -3810,7 +3835,7 @@
+ 		Say(SOUND_PED_DEFEND);
+ 
+ 	} else if (m_vecDamageNormal.z < -0.8f && impulse > 3.0f
+-		|| impulse > 6.0f && (!IsPlayer() || impulse > 10.0f)) {
++		|| impulse > 6.0f && (!IsPlayer() || impulse > 10.0f) || lowSpeedRagdollHit) {
+ 
+ 		bIsStanding = false;
+ 		uint8 fallDirection = GetLocalDirection(-car->m_vecMoveSpeed);
+@@ -3834,8 +3859,8 @@
+ 			m_vecMoveSpeed = car->m_vecMoveSpeed * 0.75f;
+ 		}
+ 		m_vecMoveSpeed.z = 0.0f;
+-		// The knockdown itself ragdolls, with the launch speed set just
+-		// above; the canned flight only plays when this refuses the ped.
++		// VehicleImpact replaces the legacy launch with the pre-response motion
++		// after this native damage/fall transition admits the visual ragdoll.
+ 		VrRagdoll::BeginFall(this);
+ 		distVec.Normalise();
+ 		distVec *= Min(car->m_fMass / 1400.0f, 1.0f);
+@@ -3843,8 +3868,16 @@
+ 		Say(SOUND_PED_DEFEND);
+ 	}
+ 
+-	if(car->IsCar() && !car->IsRealHeli() && !car->IsRealPlane())
+-		VrRagdoll::VehicleImpact(this, car, incomingRagdollSpeed, impulse);
++	if(car->IsCar() && !car->IsRealHeli() && !car->IsRealPlane()){
++		VrRagdoll::VehicleImpact(this, car, incomingRagdollSpeed, impulse,
++			contactPoint, preCollisionTurn);
++		// Retain the native fallback only when no visual ragdoll owns the ped.
++		// Otherwise its next update must not inherit the canned root launch.
++		if(preCollisionSpeed && VrRagdoll::Owns(this)){
++			m_vecMoveSpeed = incomingRagdollSpeed;
++			if(preCollisionTurn) m_vecTurnSpeed = *preCollisionTurn;
++		}
++	}
+ 	if (IsGangMember()) {
+ 		CPed *driver = car->pDriver;
+ 		if (driver && driver->IsPlayer()
+--- a/src/weapons/Weapon.cpp
++++ b/src/weapons/Weapon.cpp
+@@ -1013,6 +1013,31 @@
+ 		CWorld::bIncludeCarTyres = false;
+ 		if(victim)
+ 			CheckForShootingVehicleOccupant(&victim, &point, m_eWeaponType, source, target);
++
++		// Police helicopters use a separate shot-down counter: ordinary vehicle
++		// health damage alone cannot destroy CHeli. Restore the native bullet
++		// test for tracked aim, bounded by the first world impact for cover.
++		CVector heliTarget = victim ? point.point : target;
++		if(victim && victim->IsVehicle() && ((CVehicle*)victim)->IsHeli()){
++			// The chopper's tail collider extends beyond its 5m damage proxy.
++			// Its own surface must not shield that proxy. Continue only to the
++			// closest point to this helicopter, still inside weapon range.
++			const CVector ray = target-source;
++			const float rayLengthSq = ray.MagnitudeSqr();
++			if(rayLengthSq > 0.0001f){
++				const float t = Min(1.0f, Max(0.0f,
++					DotProduct(victim->GetPosition()-source, ray)/rayLengthSq));
++				if(t*rayLengthSq > DotProduct(heliTarget-source, ray))
++					heliTarget = source+ray*t;
++			}
++		}
++		CVector bulletPos;
++		if(CHeli::TestBulletCollision(&source, &heliTarget, &bulletPos, 4)){
++			const int32 rotSpeed = m_eWeaponType == WEAPONTYPE_M4 ? 4 : 1;
++			for(int32 i = 0; i < 16; i++)
++				CParticle::AddParticle(PARTICLE_SPARK, bulletPos,
++					CVector(0.0f, 0.0f, 0.0f), nil, 0.0f, rotSpeed);
++		}
+ 	}
+ 	else
+ #endif

@@ -8,16 +8,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 get_filename_component(REVC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)
 set(LIBRW_DIR "${REVC_ROOT}/vendor/librw")
 
-# Staged port. Bring-up builds only the OpenXR + Vulkan session so the
-# toolchain, the loader and the headset round-trip can be validated before the
-# game's 700-odd translation units enter the build.
+# Optional OpenXR/Vulkan-only target for toolchain diagnostics.
 option(MIAMIVR_BRINGUP "Build only the OpenXR/Vulkan bring-up target" OFF)
 
-# AddressSanitizer. Two separate threads have faulted inside the Meta runtime
-# on pointers holding UTF-16 text and on null, which is the signature of heap
-# corruption somewhere else in the process rather than a fault at the site.
-# ASan reports the write that does the damage instead of the read that trips
-# over it later. Costs roughly 2-3x, which is fine for diagnosis.
+# Explicit opt-in; neither Gradle debug nor RelWithDebInfo enables tools.
+# Keep C++ and every shader on the same definition because the debug scene
+# uniform and draw tint do not exist in player builds.
+option(MIAMIVR_DEV_TOOLS "Include developer-only diagnostics and test tools" OFF)
+
+# Optional AddressSanitizer instrumentation for native memory diagnostics.
 option(MIAMIVR_ASAN "Build with AddressSanitizer" OFF)
 if(MIAMIVR_ASAN)
 	add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
@@ -48,13 +47,11 @@ file(MAKE_DIRECTORY "${SPIRV_OUT_DIR}")
 # ;
 function(compile_shader SRC STAGE SYMBOL OUTDIR INCDIR)
 	set(OUT "${OUTDIR}/${SYMBOL}.h")
-	# The depfile is what makes an edit to an included .glsl rebuild every
-	# shader that includes it. Listing only SRC is not enough and fails
-	# silently in the worst possible way: a stale shader keeps the previous
-	# uniform block offsets and reads the new buffer at the old addresses.
+	# Track GLSL includes so uniform changes rebuild dependent shaders.
 	add_custom_command(
 		OUTPUT "${OUT}"
 		COMMAND "${GLSLC}" -fshader-stage=${STAGE} --target-env=vulkan1.1 -O ${ARGN}
+		        -DMIAMIVR_DEV_TOOLS=$<BOOL:${MIAMIVR_DEV_TOOLS}>
 		        -I "${INCDIR}" -MD -MF "${OUT}.d" -mfmt=c -o "${OUT}" "${SRC}"
 		DEPENDS "${SRC}"
 		DEPFILE "${OUT}.d"
@@ -127,7 +124,7 @@ add_library(librw STATIC
 add_dependencies(librw librw_shaders)
 target_include_directories(librw PUBLIC "${LIBRW_DIR}" "${LIBRW_DIR}/src")
 target_include_directories(librw PRIVATE "${LIBRW_SPIRV_DIR}")
-target_compile_definitions(librw PUBLIC RW_VULKAN)
+target_compile_definitions(librw PUBLIC RW_VULKAN MIAMIVR_DEV_TOOLS=$<BOOL:${MIAMIVR_DEV_TOOLS}>)
 target_link_libraries(librw vulkan log)
 target_compile_options(librw PRIVATE
 	-Wno-unused-parameter
@@ -183,6 +180,17 @@ if(NOT MIAMIVR_BRINGUP)
 		"${REVC_ROOT}/src/vehicles/VehicleVisualDirector.cpp")
 	list(REMOVE_ITEM GAME_SOURCES "${VEHICLE_VISUAL_DIRECTOR_SOURCE}")
 	list(APPEND GAME_SOURCES "${VEHICLE_VISUAL_DIRECTOR_SOURCE}")
+	set(VEHICLE_DEFORMATION_SOURCE
+		"${REVC_ROOT}/src/vehicles/VehicleDeformation.cpp")
+	list(REMOVE_ITEM GAME_SOURCES "${VEHICLE_DEFORMATION_SOURCE}")
+	list(APPEND GAME_SOURCES "${VEHICLE_DEFORMATION_SOURCE}")
+	# Exclude the tool translation unit entirely in player builds. The header
+	# still provides constant-false/no-op entry points for defensive callers.
+	set(VR_CULL_VIZ_SOURCE "${REVC_ROOT}/src/render/VrCullViz.cpp")
+	list(REMOVE_ITEM GAME_SOURCES "${VR_CULL_VIZ_SOURCE}")
+	if(MIAMIVR_DEV_TOOLS)
+		list(APPEND GAME_SOURCES "${VR_CULL_VIZ_SOURCE}")
+	endif()
 
 	# Quest audio uses a native AAudio SFX mixer and the Android platform
 	# decoder for long radio/cutscene streams.  The desktop OpenAL/Miles
@@ -234,6 +242,7 @@ target_include_directories(miamivr PRIVATE
 	${GAME_INCLUDES})
 
 target_compile_definitions(miamivr PRIVATE
+	MIAMIVR_DEV_TOOLS=$<BOOL:${MIAMIVR_DEV_TOOLS}>
 	XR_USE_PLATFORM_ANDROID
 	XR_USE_GRAPHICS_API_VULKAN
 	VK_USE_PLATFORM_ANDROID_KHR)

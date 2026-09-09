@@ -10,6 +10,9 @@ param(
     [string]$Serial,
     [string]$HdArchive,
     [string]$ModsArchive,
+    [string]$XboxArchive,
+    [switch]$SkipXbox,
+    [switch]$XboxOnly,
     [switch]$BuildOnly,
     [switch]$AcceptDownloads,
     [switch]$NonInteractive,
@@ -18,7 +21,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$wizardVersion = "0.5.1-models-3"
+$wizardVersion = "0.5.6-models-4"
 $hdUrl = "https://drive.usercontent.google.com/download?id=1Swe1dVWDnKz8ad51y8L0ihPWVCxmFRYj&export=download&confirm=t"
 $modsUrl = "https://drive.usercontent.google.com/download?id=1y9KpKjLSna76bjz1Lf2DzP0G4AnkN_2d&export=download&confirm=t"
 $hdSize = 1878280127L
@@ -239,6 +242,7 @@ try {
     Write-Host "Required input: only a legal original GTA Vice City PC installation."
     Write-Host "The wizard downloads two external packs used by the tested build; no pack is bundled or redistributed by this repository."
     Write-Host "Modern vegetation/palms are deliberately excluded and remain Classic on Quest."
+    Write-Host "Xbox vehicles add a separate 35 MB download; -XboxOnly builds just that profile, -SkipXbox keeps the two-pack Modern route."
 
     foreach ($requiredTool in @($builder, $questInstaller)) {
         if (-not (Test-Path -LiteralPath $requiredTool -PathType Leaf)) {
@@ -246,6 +250,18 @@ try {
         }
     }
     $game = Resolve-GameFolder -Requested $GameDir
+    if ($SkipXbox -and $XboxOnly) { throw "Choose either -SkipXbox or -XboxOnly." }
+    $xboxOptions=@{GameDir=$game;WorkDir=$WorkDir;BuildOnly=$BuildOnly;AcceptDownloads=$AcceptDownloads;NonInteractive=$NonInteractive}
+    if ($XboxArchive) { $xboxOptions.XboxArchive=$XboxArchive }
+    if ($AndroidSdk) { $xboxOptions.AndroidSdk=$AndroidSdk }
+    if ($Serial) { $xboxOptions.Serial=$Serial }
+    if ($XboxOnly) {
+        if ($OutputDir) { $xboxOptions.OutputDir=$OutputDir }
+        & (Join-Path $PSScriptRoot "prepare-xbox-models.ps1") @xboxOptions
+        if (-not $?) { throw "Xbox profile preparation failed." }
+        Stop-DiagnosticLog
+        exit 0
+    }
     $work = [IO.Path]::GetFullPath($WorkDir)
     New-Item -ItemType Directory -Path $work -Force | Out-Null
     if ([string]::IsNullOrWhiteSpace($OutputDir)) {
@@ -306,6 +322,12 @@ try {
             -FailureMessage "Modern overlay build failed"
     }
 
+    if (-not $SkipXbox) {
+        $xboxOptions.BuildOnly=$true
+        & (Join-Path $PSScriptRoot "prepare-xbox-models.ps1") @xboxOptions
+        if (-not $?) { throw "Xbox profile preparation failed; no model assets were installed." }
+    }
+
     if ($BuildOnly) {
         Write-Host ""
         Write-Host "MODERN OVERLAY BUILT: $output" -ForegroundColor Green
@@ -331,6 +353,11 @@ try {
         -FailureMessage "Quest Modern model installation failed"
 
     Write-Host ""
+    if (-not $SkipXbox) {
+        $xboxOptions.BuildOnly=$false
+        & (Join-Path $PSScriptRoot "prepare-xbox-models.ps1") @xboxOptions
+        if (-not $?) { throw "Xbox profile installation failed. The existing Modern profile is preserved." }
+    }
     Write-Host "DOWNLOAD, BUILD AND QUEST INSTALL COMPLETED." -ForegroundColor Green
     Write-Host "Fully restart Vice City VR. Modern World/Weapons are selected by default; Vehicles/Peds/Vegetation remain Classic."
     Write-Host "Diagnostic log: $LogPath"

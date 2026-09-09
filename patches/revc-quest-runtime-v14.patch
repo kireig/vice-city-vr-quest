@@ -1,0 +1,365 @@
+--- a/src/entities/Entity.cpp
++++ b/src/entities/Entity.cpp
+@@ -27,6 +27,9 @@
+ #ifdef __ANDROID__
+ #include "VrRagdoll.h"
+ #endif
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++#include "VehicleDeformation.h"
++#endif
+ #include "Dummy.h"
+ #include "WindModifiers.h"
+ #ifdef GTA_VR_OCULUS
+@@ -187,6 +190,11 @@
+ {
+ 	RwFrame *f;
+ 
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	// Release private vehicle meshes while their clump and frames still exist.
++	if(VehicleDeformation::IsVehicleDeformationEnabled() && IsVehicle())
++		VehicleDeformation::Release(this);
++#endif
+ 	m_matrix.Detach();
+ 	if(m_rwObject){
+ 		if(RwObjectGetType(m_rwObject) == rpATOMIC){
+--- a/src/entities/Physical.cpp
++++ b/src/entities/Physical.cpp
+@@ -24,6 +24,7 @@
+ #include "Physical.h"
+ #if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+ #include "PhysicsDirector.h"
++#include "VehicleDeformation.h"
+ #endif
+ 
+ #ifdef WALLCLIMB_CHEAT
+@@ -39,6 +40,20 @@
+ int32 CPhysical::NumVrCollisionFlatSavedNodeVisits;
+ 
+ #if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++// Capture the original contact while its world point and receiver matrix
++// still describe the collision pose. Native records retain only the normal,
++// and deliberately use A's normal for both participants; deformation needs
++// the actual inward direction for each receiver. OFF touches no mesh/state.
++static inline void
++RecordVehicleDeformationCollision(CPhysical *receiver, CEntity *other,
++	const CColPoint &point, float impulse, bool reverseNormal)
++{
++	if(VehicleDeformation::IsVehicleDeformationEnabled() && receiver->IsVehicle() &&
++	   ((CVehicle*)receiver)->IsCar() && !other->IsPed())
++		VehicleDeformation::RecordCollision((CVehicle*)receiver, point.point,
++			reverseNormal ? -point.normal : point.normal, impulse, other);
++}
++
+ namespace {
+ 
+ // This cache never performs collision work.  It only records the exact sector,
+@@ -1198,8 +1213,15 @@
+ 				A->ApplyTurnForce(fA, pointposA);
+ 			}
+ 			if(!B->bInfiniteMass){
+-				if(B->bIsInSafePosition)
++				if(B->bIsInSafePosition){
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++					// The rollback changes B's matrix. Capture its contact first;
++					// the equal-strength ordinary record keeps this earlier pose.
++					if(impulseB > B->m_fDamageImpulse)
++						RecordVehicleDeformationCollision(B, A, colpoint, impulseB, true);
++#endif
+ 					B->UnsetIsInSafePosition();
++				}
+ 				B->ApplyMoveForce(fB);
+ 				B->ApplyTurnForce(fB, pointposB);
+ 			}
+@@ -1779,11 +1801,19 @@
+ 			if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 				continue;
+ 
+-			if(impulseA > A->m_fDamageImpulse)
++			if(impulseA > A->m_fDamageImpulse){
+ 				A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-
+-			if(impulseB > B->m_fDamageImpulse)
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++			}
++
++			if(impulseB > B->m_fDamageImpulse){
+ 				B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
++#endif
++			}
+ 
+ 			float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+ 			float moveSpeedDiff = (B->m_vecMoveSpeed - A->m_vecMoveSpeed).MagnitudeSqr();
+@@ -1801,11 +1831,19 @@
+ 			if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 				continue;
+ 
+-			if(impulseA > A->m_fDamageImpulse)
++			if(impulseA > A->m_fDamageImpulse){
+ 				A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-
+-			if(impulseB > B->m_fDamageImpulse)
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++			}
++
++			if(impulseB > B->m_fDamageImpulse){
+ 				B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
++#endif
++			}
+ 
+ 			float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+ 			float moveSpeedDiff = (B->m_vecMoveSpeed - A->m_vecMoveSpeed).MagnitudeSqr();
+@@ -1834,11 +1872,19 @@
+ 			if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 				continue;
+ 
+-			if(impulseA > A->m_fDamageImpulse)
++			if(impulseA > A->m_fDamageImpulse){
+ 				A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-
+-			if(impulseB > B->m_fDamageImpulse)
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++			}
++
++			if(impulseB > B->m_fDamageImpulse){
+ 				B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
++#endif
++			}
+ 
+ 			float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+ 			float moveSpeedDiff = (B->m_vecMoveSpeed - A->m_vecMoveSpeed).MagnitudeSqr();
+@@ -1861,11 +1907,19 @@
+ 			if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 				continue;
+ 
+-			if(impulseA > A->m_fDamageImpulse)
++			if(impulseA > A->m_fDamageImpulse){
+ 				A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-
+-			if(impulseB > B->m_fDamageImpulse)
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++			}
++
++			if(impulseB > B->m_fDamageImpulse){
+ 				B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
++#endif
++			}
+ 
+ 			float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+ 			float moveSpeedDiff = (B->m_vecMoveSpeed - A->m_vecMoveSpeed).MagnitudeSqr();
+@@ -2053,8 +2107,12 @@
+ 
+ 						if(A->IsVehicle()){
+ 							if(!(((CVehicle*)A)->IsBoat() && aColPoints[i].surfaceB == SURFACE_WOOD_SOLID) &&
+-							   impulseA > A->m_fDamageImpulse)
++							   impulseA > A->m_fDamageImpulse){
+ 								A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++								RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++							}
+ 
+ 							if(CSurfaceTable::GetAdhesionGroup(aColPoints[i].surfaceB) == ADHESIVE_SAND)
+ 								aColPoints[i].surfaceB = SURFACE_SAND;
+@@ -2070,8 +2128,12 @@
+ 								DMAudio.ReportCollision(A, B, aColPoints[i].surfaceA, aColPoints[i].surfaceB, impulseA, Max(turnSpeedDiff, moveSpeedDiff));
+ 
+ 						}else{
+-							if(impulseA > A->m_fDamageImpulse)
++							if(impulseA > A->m_fDamageImpulse){
+ 								A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++								RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++							}
+ 
+ 							float turnSpeedDiff = A->m_vecTurnSpeed.MagnitudeSqr();
+ 							float moveSpeedDiff = A->m_vecMoveSpeed.MagnitudeSqr();
+@@ -2091,8 +2153,12 @@
+ 						if(A->IsVehicle()){
+ 							if(((CVehicle*)A)->IsBoat() && aColPoints[i].surfaceB == SURFACE_WOOD_SOLID)
+ 								adhesion = 0.0f;
+-							else if(impulseA > A->m_fDamageImpulse)
++							else if(impulseA > A->m_fDamageImpulse){
+ 								A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++								RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++							}
+ 
+ 							if(CSurfaceTable::GetAdhesionGroup(aColPoints[i].surfaceB) == ADHESIVE_SAND)
+ 								aColPoints[i].surfaceB = SURFACE_SAND;
+@@ -2124,8 +2190,12 @@
+ 							else
+ 								adhesion *= Min(5.0f, 0.03f*impulseA + 1.0f);
+ 						}else{
+-							if(impulseA > A->m_fDamageImpulse)
++							if(impulseA > A->m_fDamageImpulse){
+ 								A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++								RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++							}
+ 
+ 							float turnSpeedDiff = A->m_vecTurnSpeed.MagnitudeSqr();
+ 							float moveSpeedDiff = A->m_vecMoveSpeed.MagnitudeSqr();
+@@ -2184,11 +2254,19 @@
+ 						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
+ 						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+-						if(impulseA > A->m_fDamageImpulse)
++						if(impulseA > A->m_fDamageImpulse){
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-
+-						if(impulseB > B->m_fDamageImpulse)
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++							RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++						}
++
++						if(impulseB > B->m_fDamageImpulse){
+ 							B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++							RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
++#endif
++						}
+ 
+ 						float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+ 						float moveSpeedDiff = (B->m_vecMoveSpeed - A->m_vecMoveSpeed).MagnitudeSqr();
+@@ -2209,11 +2287,19 @@
+ 						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
+ 						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+-						if(impulseA > A->m_fDamageImpulse)
++						if(impulseA > A->m_fDamageImpulse){
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-
+-						if(impulseB > B->m_fDamageImpulse)
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++							RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++						}
++
++						if(impulseB > B->m_fDamageImpulse){
+ 							B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++							RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
++#endif
++						}
+ 
+ 						float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+ 						float moveSpeedDiff = (B->m_vecMoveSpeed - A->m_vecMoveSpeed).MagnitudeSqr();
+@@ -2245,11 +2331,19 @@
+ 						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
+ 						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+-						if(impulseA > A->m_fDamageImpulse)
++						if(impulseA > A->m_fDamageImpulse){
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-
+-						if(impulseB > B->m_fDamageImpulse)
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++							RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++						}
++
++						if(impulseB > B->m_fDamageImpulse){
+ 							B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++							RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
++#endif
++						}
+ 
+ 						float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+ 						float moveSpeedDiff = (B->m_vecMoveSpeed - A->m_vecMoveSpeed).MagnitudeSqr();
+@@ -2275,11 +2369,19 @@
+ 						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
+ 						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+-						if(impulseA > A->m_fDamageImpulse)
++						if(impulseA > A->m_fDamageImpulse){
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-
+-						if(impulseB > B->m_fDamageImpulse)
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++							RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
++#endif
++						}
++
++						if(impulseB > B->m_fDamageImpulse){
+ 							B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++							RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
++#endif
++						}
+ 
+ 						float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+ 						float moveSpeedDiff = (B->m_vecMoveSpeed - A->m_vecMoveSpeed).MagnitudeSqr();
+--- a/src/vehicles/Automobile.cpp
++++ b/src/vehicles/Automobile.cpp
+@@ -56,6 +56,7 @@
+ #endif
+ #if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+ #include "PhysicsDirector.h"
++#include "VehicleDeformation.h"
+ #endif
+ 
+ bool bAllCarCheat;
+@@ -251,6 +252,8 @@
+ CAutomobile::SetModelIndex(uint32 id)
+ {
+ #if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++	if(VehicleDeformation::IsVehicleDeformationEnabled())
++		VehicleDeformation::Release(this);
+ 	m_bVrSteeringWheelNeutralValid = false;
+ 	m_fVrSteeringWheelAppliedAngle = 0.0f;
+ #endif
+@@ -1791,6 +1794,9 @@
+ 	// Do this before the clump is submitted. It is a no-op for the stock/baked
+ 	// cabin wheel and for every replacement model without a dedicated frame.
+ 	OculusVR::UpdateImmersiveCarModelSteeringWheel(this);
++	// The module only processes a queued collision. OFF never enters it.
++	if(VehicleDeformation::IsVehicleDeformationEnabled())
++		VehicleDeformation::Process(this);
+ #endif
+ 
+ 	if(GetModelIndex() == MI_RHINO && m_aCarNodes[CAR_WINDSCREEN]){
+@@ -5504,6 +5510,10 @@
+ {
+ 	int component;
+ 
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	if(VehicleDeformation::IsVehicleDeformationEnabled())
++		VehicleDeformation::Release(this);
++#endif
+ 	Damage.ResetDamageStatus();
+ 
+ 	if(pHandling->Flags & HANDLING_NO_DOORS){
+@@ -5639,6 +5649,12 @@
+ 	matrix = RwFrameGetLTM(m_aCarNodes[component]);
+ 	frame = RwFrameCreate();
+ 	atomic = RpAtomicClone(atomic);
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	// Detached debris uses native geometry, so OFF can release every dent copy
++	// without scanning the object pool or leaving subdivided debris behind.
++	if(VehicleDeformation::IsVehicleDeformationEnabled())
++		VehicleDeformation::PrepareDetachedAtomic(atomic);
++#endif
+ 	*RwFrameGetMatrix(frame) = *matrix;
+ 	RpAtomicSetFrame(atomic, frame);
+ 	CVisibilityPlugins::SetAtomicRenderCallback(atomic, nil);

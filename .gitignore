@@ -62,3 +62,9 @@ Thumbs.db
 *.bak
 *.orig
 *.rej
+
+# Generated host-test extraction and local diagnostics (source fixtures stay)
+tools/tests/*.inc
+tools/tests/checks-*/
+tools/tests/audit-*/
+tools/tests/audit-*

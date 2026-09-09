@@ -78,6 +78,11 @@ layout(set = 0, binding = 0) uniform SceneData {
 	// sparks / unused.
 	vec4 waterParams1;
 	vec4 waterParams2;
+	// x != 0 = culling visualizer active; the draw's flat colour index then
+	// arrives in surfaceProps.z instead of the packed light mask.
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+	vec4 vizParams;
+#endif
 } scene;
 
 layout(push_constant) uniform PushConstants {

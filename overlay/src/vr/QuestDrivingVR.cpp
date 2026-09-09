@@ -139,6 +139,9 @@ static bool gSettingsLoaded;
 static int gCarDrivingType;
 static int gBikeDrivingType;
 static int gBoatDrivingType;
+static bool gVehicleForwardFireEnabled;
+static CVehicle *gButtonDriveByVehicle;
+static int gButtonDriveByDirection = -1;
 static int gMotionSteeringHand = 1;
 // How far the gripping hand is pulled off the wheel plane, towards the
 // driver, so the rim does not end up inside its wrist.
@@ -358,6 +361,8 @@ LoadDrivingSettings()
 {
 	if(gSettingsLoaded)
 		return;
+	gVehicleForwardFireEnabled = GetPrivateProfileIntA("VR",
+		"DefaultVehicleForwardFire", 0, kSettingsPath) != 0;
 	char drivingType[16] = {};
 	GetPrivateProfileStringA("VR", "DrivingType", "", drivingType,
 		sizeof(drivingType), kSettingsPath);
@@ -793,6 +798,8 @@ struct BuiltInVehicleCategoryDefaults
 };
 
 static const BuiltInVehicleCategoryDefaults gBuiltInVehicleCategoryDefaults[] = {
+	{ ModelSets::MODEL_SET_XBOX, VR_VEHICLE_CATEGORY_CAR,
+		{ 0,0, 0,0,0, 18,0, 0,0,0 } },
 	{ ModelSets::MODEL_SET_CLASSIC, VR_VEHICLE_CATEGORY_CAR,
 		{ 0,0, -1,4,8, 18,0, 0,0,0 } },
 	{ ModelSets::MODEL_SET_CLASSIC, VR_VEHICLE_CATEGORY_BIKE,
@@ -888,7 +895,9 @@ ReloadVehicleCalibration()
 	for(int type = 0; type < VR_DEFAULT_VIEW_COUNT; type++){
 		gDefaultVehicleViewOffset[type].seatHeightCm = clamp(
 			(int)(int32)GetPrivateProfileIntA("VR", heightKeys[type],
-				legacyHeight, kSettingsPath), -100, 150);
+				type == VR_DEFAULT_VIEW_CAR && ModelSets::GetActiveForCategory(
+					ModelSets::MODEL_CATEGORY_VEHICLES) == ModelSets::MODEL_SET_XBOX ?
+					0 : legacyHeight, kSettingsPath), -100, 150);
 		gDefaultVehicleViewOffset[type].seatDistanceCm = clamp(
 			(int)(int32)GetPrivateProfileIntA("VR", distanceKeys[type],
 				0, kSettingsPath), -100, 100);
@@ -2435,40 +2444,46 @@ MapHandbrakeToPad(CControllerState *state, bool pressed)
 }
 
 static void
-MapDefaultDriveBy(CControllerState *state,
+MapButtonDriveBy(CControllerState *state,
 	const androidgame::PadInput &input, bool blocked)
 {
+	gButtonDriveByVehicle = nil;
+	gButtonDriveByDirection = -1;
 	CVehicle *vehicle = FindPlayerVehicle();
 	if(!state || blocked || !vehicle ||
-	   GetDrivingTypeForVehicle(vehicle) != VR_DRIVING_DEFAULT)
+	   vehicle->pDriver != FindPlayerPed() ||
+	   vehicle->IsRealHeli() || vehicle->IsRealPlane())
 		return;
-	const bool left = input.b &&
-		input.leftGrip >= 0.55f && input.rightGrip < 0.55f;
-	const bool right = input.b &&
-		input.rightGrip >= 0.55f && input.leftGrip < 0.55f;
-	const bool forward = input.b &&
-		input.leftGrip < 0.55f && input.rightGrip < 0.55f &&
-		vehicle->IsBike();
-	if(left){
-		// The grip selects the drive-by side; it must not also reach the
-		// current pad mode as handbrake, horn or exit-vehicle input.
-		state->LeftShoulder1 = 0;
-		state->LeftShoulder2 =
-			Max(state->LeftShoulder2, (int16)255);
-	}
-	if(right){
+	// Pad mode 3 uses R1 for firing; the raw right grip must not fire on its own.
+	if(CPad::GetPad(0)->GetMode() == 3)
 		state->RightShoulder1 = 0;
-		state->RightShoulder2 =
-			Max(state->RightShoulder2, (int16)255);
+	if(!input.b || (IsVrDrivingActive() &&
+	    (IsTrackedWeaponHeld(0) || IsTrackedWeaponHeld(1))))
+		return;
+	// Both grips select the driver's window; one right grip selects the right.
+	const bool left = input.leftGrip >= 0.55f;
+	const bool right =
+		input.rightGrip >= 0.55f && input.leftGrip < 0.55f;
+	const bool effectiveDefault =
+		GetDrivingTypeForVehicle(vehicle) == VR_DRIVING_DEFAULT ||
+		IsQuestVehicleThirdPerson();
+	if(!left && !right && (!gVehicleForwardFireEnabled || !effectiveDefault ||
+	    (!vehicle->IsCar() && !vehicle->IsBike()))){
+		state->Circle = 0;
+		return;
 	}
-	if(left || right || forward){
-		if(CPad::GetPad(0)->GetMode() == 3)
-			state->RightShoulder1 =
-				Max(state->RightShoulder1, (int16)255);
-		else
-			state->Circle =
-				Max(state->Circle, (int16)255);
-	}
+	gButtonDriveByVehicle = vehicle;
+	gButtonDriveByDirection = left ? 1 : right ? 2 : 0;
+	// Grips select the shot, including partially held grips on the other
+	// controller. They must not also apply the handbrake or horn.
+	state->LeftShoulder1 = 0;
+	state->RightShoulder1 = 0;
+	state->LeftShoulder2 = left ? 255 : 0;
+	state->RightShoulder2 = right ? 255 : 0;
+	if(CPad::GetPad(0)->GetMode() == 3)
+		state->RightShoulder1 = 255;
+	else
+		state->Circle = 255;
 }
 
 } // namespace
@@ -2499,8 +2514,6 @@ UpdateQuestDrivingInput(CControllerState *state, bool blocked)
 		state->Cross = (int16)(clamp(
 			input.rightTrigger, 0.0f, 1.0f)*255.0f);
 	}
-	MapDefaultDriveBy(state, input, blocked);
-
 	const float grips[VR_HAND_COUNT] = {
 		input.leftGrip, input.rightGrip
 	};
@@ -2533,15 +2546,23 @@ UpdateQuestDrivingInput(CControllerState *state, bool blocked)
 		}
 	}
 	MapHornToPad(state);
-	// Apply this after physical-grip cleanup: grabbed steering hands must not
-	// erase the explicit face-button handbrake.
-	MapHandbrakeToPad(state, vehicle && !blocked && input.a);
 	return captured;
+}
+
+void
+ApplyQuestVehicleButtonInput(CControllerState *state, bool blocked)
+{
+	const androidgame::PadInput &input = androidgame::GetPadInput();
+	MapButtonDriveBy(state, input, blocked);
+	// The explicit handbrake remains available while firing.
+	MapHandbrakeToPad(state, FindPlayerVehicle() && !blocked && input.a);
 }
 
 void
 ResetQuestDrivingInteraction()
 {
+	gButtonDriveByVehicle = nil;
+	gButtonDriveByDirection = -1;
 	ResetBikeInteraction();
 	ResetCarInteraction();
 	ResetMotionInteraction();
@@ -2683,6 +2704,28 @@ bool IsImmersiveCarDrivingActive() { return IsImmersiveCarActive(); }
 bool IsImmersiveBikeDrivingActive() { return IsImmersiveBikeActive(); }
 bool IsVrCarDrivingActive() { return IsVrCarActive(); }
 bool IsVrBikeDrivingActive() { return IsVrBikeActive(); }
+
+int
+GetQuestVehicleButtonFireDirection(CVehicle *vehicle)
+{
+	return vehicle && vehicle == gButtonDriveByVehicle ?
+		gButtonDriveByDirection : -1;
+}
+
+bool
+IsQuestVehicleForwardFireEnabled()
+{
+	LoadDrivingSettings();
+	return gVehicleForwardFireEnabled;
+}
+
+void
+SetQuestVehicleForwardFireEnabled(bool enabled)
+{
+	LoadDrivingSettings();
+	gVehicleForwardFireEnabled = enabled;
+	SaveSetting("DefaultVehicleForwardFire", enabled ? 1 : 0);
+}
 
 bool
 IsVrRadioControlActive()

@@ -716,9 +716,17 @@ drawAtomicMeshes(Atomic *atomic, InstanceDataHeader *header, uint32 shader,
 				}
 			}
 		}
-		push.surfaceProps[2] = (float32)(lightMask |
-			((geometry->flags & Geometry::NORMALS) ? 0x10000u : 0u) |
-			envBits << 17 | ownVehicleBit | waterBit);
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+		// The visualizer replaces the packed mask with a bare colour index.
+		// It cannot share the float: the normal bits already reach 2^24
+		// (water), and anything above that loses integer precision.
+		if(gvk.debugVizActive)
+			push.surfaceProps[2] = (float32)gvk.debugTint;
+		else
+#endif
+			push.surfaceProps[2] = (float32)(lightMask |
+				((geometry->flags & Geometry::NORMALS) ? 0x10000u : 0u) |
+				envBits << 17 | ownVehicleBit | waterBit);
 		push.surfaceProps[3] = gsSplit ?
 			(gsPass == 0 ? gstate.gsAlphaTestRef/255.0f :
 				-(float32)gstate.gsAlphaTestRef/255.0f) :

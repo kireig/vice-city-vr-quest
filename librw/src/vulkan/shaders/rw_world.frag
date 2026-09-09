@@ -80,11 +80,19 @@ void main()
 	// the CPU: surfaceProps.z packs the surface mask in bits 0-7, the air-glow
 	// mask in bits 8-15 and a real-normals flag in bit 16, so the draws away
 	// from every light -- most of a frame -- skip everything here.
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+	const bool vizActive = scene.vizParams.x > 0.5;
+#endif
 	if(RW_WORLD_EFFECTS != 0){
 	const int lightBits = int(push.surfaceProps.z);
 	const int surfaceMask = lightBits & 0xFF;
 	const int glowMask = (lightBits >> 8) & 0xFF;
-	if((surfaceMask | glowMask) != 0 && push.surfaceProps.y > 0.0){
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+	if(!vizActive && (surfaceMask | glowMask) != 0 &&
+#else
+	if((surfaceMask | glowMask) != 0 &&
+#endif
+	   push.surfaceProps.y > 0.0){
 		const int lightTotal = int(scene.lightCount.x);
 		const vec3 eye = scene.im2dParams.yzw;
 		vec3 normal = vec3(0.0);
@@ -397,6 +405,22 @@ void main()
 	}
 
 	}
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+	// Culling visualizer: paint the draw its debug colour. The index is the
+	// whole of surfaceProps.z here (the pack was suppressed on the CPU), so
+	// the texture still reads through underneath at 40 percent.
+	if(vizActive){
+		const vec3 pal[5] = vec3[5](vec3(0.0),
+			vec3(0.20, 0.45, 1.00),   // visible
+			vec3(1.00, 0.14, 0.10),   // frustum-culled
+			vec3(1.00, 0.55, 0.10),   // occluder-culled
+			vec3(1.00, 0.90, 0.15));  // distance / LOD
+		int idx = clamp(int(push.surfaceProps.z), 0, 4);
+		if(idx != 0)
+			colour.rgb = mix(colour.rgb, pal[idx], 0.6);
+	}
+#endif
+
 	colour.rgb = mix(scene.fogColour.rgb, colour.rgb, fragFog);
 	outColour = colour;
 	// Compact dynamic-vector transport. The post pass divides by the same gain.

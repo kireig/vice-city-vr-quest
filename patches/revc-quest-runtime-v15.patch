@@ -1,0 +1,197 @@
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -2,6 +2,9 @@
+ #include "platform.h"
+ 
+ #include "Game.h"
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++#include "VehicleDeformation.h"
++#endif
+ #include "main.h"
+ #include "RwHelper.h"
+ #include "Accident.h"
+@@ -1028,6 +1031,10 @@
+ 		CTimeCycle::Update();
+ 		if (CReplay::ShouldStandardCameraBeProcessed())
+ 			TheCamera.Process();
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++		if(VehicleDeformation::IsVehicleDeformationEnabled())
++			VehicleDeformation::Update();
++#endif
+ 		CCullZones::Update();
+ 		if (!CReplay::IsPlayingBack())
+ 			CGameLogic::Update();
+--- a/src/core/Pad.cpp
++++ b/src/core/Pad.cpp
+@@ -710,8 +710,7 @@
+ };
+ 
+ enum eVrSpecialCheatIndex {
+-	VR_SPECIAL_PASS_CURRENT_MISSION = 0,
+-	VR_SPECIAL_SPAWN_NEXT_CAR,
++	VR_SPECIAL_SPAWN_NEXT_CAR = 0,
+ 	VR_SPECIAL_SPAWN_NEXT_MOTORCYCLE,
+ 	VR_SPECIAL_SPAWN_NEXT_HELICOPTER,
+ 	VR_SPECIAL_SPAWN_NEXT_AIRPLANE,
+@@ -897,86 +896,6 @@
+ 	}
+ }
+ 
+-struct VrMissionPassEntry
+-{
+-	const char *scriptName;
+-	uint16 successOffset;
+-	uint16 expectedCommand;
+-};
+-
+-// Enter the standard main.scm mission's own success block instead of merely
+-// incrementing the passed-mission statistic. This preserves each mission's
+-// normal reward, story flags, unlocks and cleanup path.
+-static const VrMissionPassEntry gVrMissionPassEntries[] = {
+-	{ "LAWYER1", 12177, 0x0004 }, { "LAWYER2", 13332, 0x0004 },
+-	{ "LAWYER3", 8066, 0x0004 },  { "LAWYER4", 9049, 0x0004 },
+-	{ "GENERL1", 8885, 0x00BE },  { "COL2", 9912, 0x0004 },
+-	{ "GENERL3", 26195, 0x0004 }, { "COL_4", 28424, 0x0004 },
+-	{ "COL_5", 30843, 0x0004 },   { "BARON1", 8656, 0x0004 },
+-	{ "BARON2", 13929, 0x0004 },  { "BARON3", 7671, 0x0004 },
+-	{ "BARON4", 10301, 0x0004 },  { "BARON5", 12576, 0x0004 },
+-	{ "KENT1", 7704, 0x0004 },    { "SERG1", 9816, 0x0004 },
+-	{ "SERG3", 21004, 0x0004 },   { "SERG2", 4997, 0x055B },
+-	{ "BANKJO1", 7652, 0x0004 },  { "BANKJO2", 27114, 0x0004 },
+-	{ "BANKJO3", 7448, 0x0004 },  { "BANKJO4", 22580, 0x009B },
+-	{ "PHIL1", 12343, 0x00BE },   { "PHIL2", 7011, 0x00BE },
+-	{ "PORNO1", 11181, 0x00BE },  { "PORNO2", 7451, 0x00BE },
+-	{ "PORNO3", 9249, 0x00BE },   { "PORNO4", 11351, 0x00BE },
+-	{ "PROTEC1", 6954, 0x00BE },  { "PROTEC2", 12064, 0x00BE },
+-	{ "PROTEC3", 11951, 0x00BE }, { "COUNT1", 6520, 0x0004 },
+-	{ "COUNT2", 19197, 0x0395 },  { "CAP_1", 9176, 0x0004 },
+-	{ "FIN_1", 27218, 0x0004 },   { "BIKE1", 7000, 0x0004 },
+-	{ "BIKE2", 1911, 0x0004 },    { "BIKE3", 5002, 0x0004 },
+-	{ "CUBAN1", 10680, 0x00BE },  { "CUBAN2", 16562, 0x00BE },
+-	{ "CUBAN3", 11513, 0x00BE },  { "CUBAN4", 20119, 0x00BE },
+-	{ "HAIT1", 5519, 0x0004 },    { "HAIT2", 17571, 0x0004 },
+-	{ "HAIT3", 4031, 0x0004 },    { "ROCKB1", 7151, 0x0004 },
+-	{ "ROCKB2", 9504, 0x0004 },   { "ROCKB3", 9225, 0x0004 },
+-	{ "RANGE", 6162, 0x01EB },    { "ASSIN1", 1841, 0x0004 },
+-	{ "ASSIN2", 4088, 0x0004 },   { "ASSIN3", 6637, 0x0004 },
+-	{ "ASSIN4", 8263, 0x0004 },   { "ASSIN5", 12394, 0x0004 },
+-	{ "TAXWAR1", 3925, 0x0004 },  { "TAXWAR2", 1613, 0x0004 },
+-	{ "TAXWAR3", 5369, 0x0004 },  { "ICECRE1", 4073, 0x030C }
+-};
+-
+-static bool
+-PassCurrentVrMission(void)
+-{
+-	if(!FindPlayerPed() || !CTheScripts::IsPlayerOnAMission())
+-		return false;
+-
+-	for(CRunningScript *script = CTheScripts::pActiveScripts;
+-	    script; script = script->GetNext()){
+-		if(!script->m_bIsActive || !script->m_bIsMissionScript ||
+-		   !script->m_bMissionFlag || script->m_nStackPointer < 1)
+-			continue;
+-		for(int i = 0; i < (int)ARRAY_SIZE(gVrMissionPassEntries); i++){
+-			const VrMissionPassEntry &entry = gVrMissionPassEntries[i];
+-			if(strncmp(script->m_abScriptName, entry.scriptName,
+-			   KEY_LENGTH_IN_SCRIPT) != 0)
+-				continue;
+-			const uint32 target =
+-				SIZE_MAIN_SCRIPT+(uint32)entry.successOffset;
+-			if(target+1 >= SIZE_SCRIPT_SPACE)
+-				return false;
+-			const uint16 targetCommand =
+-				(CTheScripts::ScriptSpace[target] |
+-				 (CTheScripts::ScriptSpace[target+1] << 8)) & 0x7FFF;
+-			if(targetCommand != entry.expectedCommand)
+-				return false;
+-			while(script->m_nStackPointer > 1)
+-				--script->m_nStackPointer;
+-			script->SetIP(target);
+-			script->m_nWakeTime = 0;
+-			script->m_bSkipWakeTime = false;
+-			script->m_bCondResult = false;
+-			script->m_bNotFlag = false;
+-			return true;
+-		}
+-	}
+-	return false;
+-}
+-
+ static void
+ ApplyVrGodMode(void)
+ {
+@@ -1252,8 +1171,6 @@
+ 	static char helicopterName[64];
+ 	static char airplaneName[64];
+ 	static char boatName[64];
+-	if(index == VR_SPECIAL_PASS_CURRENT_MISSION)
+-		return "PASS CURRENT MISSION";
+ 	if(index == VR_SPECIAL_SPAWN_NEXT_CAR){
+ 		const int model = FindVrCycleCarModel(gVrCycleCarCursor);
+ 		sprintf(carName, "SPAWN NEXT CAR - %s",
+@@ -1345,8 +1262,6 @@
+ 
+ bool ActivateVrCheat(int index)
+ {
+-	if(index == VR_SPECIAL_PASS_CURRENT_MISSION)
+-		return PassCurrentVrMission();
+ 	if(index == VR_SPECIAL_SPAWN_NEXT_CAR){
+ 		if(!FindPlayerPed())
+ 			return false;
+--- a/src/peds/Ped.cpp
++++ b/src/peds/Ped.cpp
+@@ -21,6 +21,9 @@
+ #include "Population.h"
+ #include "VrRagdoll.h"
+ #include "Pad.h"
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS) && defined(CANCELLABLE_CAR_ENTER)
++#include "VrVehicleEntry.h"
++#endif
+ #include "Phones.h"
+ #include "TrafficLights.h"
+ #include "CopPed.h"
+@@ -1747,6 +1750,18 @@
+ void
+ CPed::ProcessControl(void)
+ {
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS) && defined(CANCELLABLE_CAR_ENTER)
++	// Observe entry even on an early-return frame, so death, an ended entry or
++	// disabled controls cannot leave an armed gesture for the next attempt.
++	static VrVehicleEntry::CancelInput vrEntryCancelInput;
++	bool vrCancelEntryMovement = false;
++	if (IsPlayer()) {
++		CPad *entryPad = CPad::GetPad(0);
++		vrCancelEntryMovement = vrEntryCancelInput.Update(this, m_pMyVehicle,
++			EnteringCar() && m_pVehicleAnim, !entryPad->ArePlayerControlsDisabled(),
++			entryPad->GetPedWalkLeftRight(), entryPad->GetPedWalkUpDown());
++	}
++#endif
+ 	CColPoint foundCol;
+ 	CEntity *foundEnt = nil;
+ 
+@@ -2616,9 +2631,13 @@
+ 					if (!pad->ArePlayerControlsDisabled()) {
+ 						int vehAnim = m_pVehicleAnim->animId;
+ 
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++						if (vrCancelEntryMovement) {
++#else
+ 						int16 padWalkX = pad->GetPedWalkLeftRight();
+ 						int16 padWalkY = pad->GetPedWalkUpDown();
+ 						if (Abs(padWalkX) > 0.0f || Abs(padWalkY) > 0.0f) {
++#endif
+ 							if (vehAnim == ANIM_STD_CAR_OPEN_DOOR_LHS || vehAnim == ANIM_STD_CAR_OPEN_DOOR_RHS || vehAnim == ANIM_STD_COACH_OPEN_LHS || vehAnim == ANIM_STD_COACH_OPEN_RHS ||
+ 								vehAnim == ANIM_STD_VAN_OPEN_DOOR_REAR_LHS || vehAnim == ANIM_STD_VAN_OPEN_DOOR_REAR_RHS) {
+ 
+--- a/src/vehicles/Automobile.cpp
++++ b/src/vehicles/Automobile.cpp
+@@ -1794,9 +1794,6 @@
+ 	// Do this before the clump is submitted. It is a no-op for the stock/baked
+ 	// cabin wheel and for every replacement model without a dedicated frame.
+ 	OculusVR::UpdateImmersiveCarModelSteeringWheel(this);
+-	// The module only processes a queued collision. OFF never enters it.
+-	if(VehicleDeformation::IsVehicleDeformationEnabled())
+-		VehicleDeformation::Process(this);
+ #endif
+ 
+ 	if(GetModelIndex() == MI_RHINO && m_aCarNodes[CAR_WINDSCREEN]){

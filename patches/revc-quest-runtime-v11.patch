@@ -1,0 +1,209 @@
+--- a/src/entities/Entity.cpp
++++ b/src/entities/Entity.cpp
+@@ -24,6 +24,9 @@
+ #include "Debug.h"
+ #include "GameRenderCommand.h"
+ #include "Ped.h"
++#ifdef __ANDROID__
++#include "VrRagdoll.h"
++#endif
+ #include "Dummy.h"
+ #include "WindModifiers.h"
+ #ifdef GTA_VR_OCULUS
+@@ -234,12 +237,21 @@
+ void
+ CEntity::GetBoundCentre(CVector &out)
+ {
++#ifdef __ANDROID__
++	float radius;
++	if(IsPed() && VrRagdoll::GetBounds((CPed*)this, out, radius)) return;
++#endif
+ 	out = m_matrix * CModelInfo::GetModelInfo(m_modelIndex)->GetColModel()->boundingSphere.center;
+ }
+ 
+ float
+ CEntity::GetBoundRadius(void)
+ {
++#ifdef __ANDROID__
++	CVector centre;
++	float radius;
++	if(IsPed() && VrRagdoll::GetBounds((CPed*)this, centre, radius)) return radius;
++#endif
+ 	return CModelInfo::GetModelInfo(m_modelIndex)->GetColModel()->boundingSphere.radius;
+ }
+ 
+--- a/src/peds/CopPed.cpp
++++ b/src/peds/CopPed.cpp
+@@ -279,6 +279,25 @@
+ void
+ CCopPed::ScanForCrimes(void)
+ {
++#if defined(GTA_VR_WEAPONS) && defined(RW_VULKAN) && defined(__ANDROID__)
++	// CivilianAI consumes ScanForThreats; cops have a separate crime scan.
++	// A tracked hand does not set the player's legacy lock-on target, so
++	// deliver visible barrel aim to the ordinary police threat reaction here.
++	// It sets the native two-star response; CopAI then handles the pursuit.
++	CPlayerPed *aimPlayer = FindPlayerPed();
++	if (aimPlayer && IsPedInControl() && !m_bIsDisabledCop && !m_bZoneDisabled &&
++		(CharCreatedBy != MISSION_CHAR || bCrouchWhenScared) &&
++		!aimPlayer->m_pWanted->m_bIgnoredByEveryone && !aimPlayer->m_pWanted->m_bIgnoredByCops &&
++		aimPlayer->m_pWanted->GetWantedLevel() < 2 && !CCullZones::NoPolice() &&
++		((CTimer::GetFrameCounter() + (uint8)m_randomSeed) & 3) == 0 &&
++		(GetPosition() - aimPlayer->GetPosition()).MagnitudeSqr2D() <= sq(15.0f)) {
++		// CheckForAimedGun rejects holstered/non-guns, off-target barrels,
++		// targets outside the cop's view cone and obstructed line of sight.
++		CPed *aiming = CheckForAimedGun();
++		if (aiming)
++			ReactToPointGun(aiming);
++	}
++#endif
+ 	CVehicle *playerVeh = FindPlayerVehicle();
+ 
+ 	// Look for car alarms
+--- a/src/peds/PlayerPed.cpp
++++ b/src/peds/PlayerPed.cpp
+@@ -632,6 +632,8 @@
+ float
+ CPlayerPed::DoWeaponSmoothSpray(void)
+ {
++	if(IsRunWithoutLimitsCheatEnabled())
++		return 0.0f;
+ 	if (m_nPedState == PED_ATTACK && !m_pPointGunAt) {
+ 		CWeaponInfo *weaponInfo = CWeaponInfo::GetWeaponInfo(GetWeapon()->m_eWeaponType);
+ 		switch (GetWeapon()->m_eWeaponType) {
+@@ -1329,15 +1331,22 @@
+ void
+ CPlayerPed::ProcessAnimGroups(void)
+ {
++	// Weapon movement groups often map RUNFAST back to their ordinary run
++	// (run_armed, run_rocket, run_csaw). Bypassing the heavy flag alone therefore
++	// still slows the player as soon as that weapon is held. Use unarmed
++	// locomotion for the cheat, retaining the directional selection below:
++	// strafe/back animations supply lateral/reverse root motion in those modes.
++	const bool unrestrictedLocomotion = IsRunWithoutLimitsCheatEnabled();
+ 	AssocGroupId groupToSet;
+-	CWeapon *locomotionWeapon = GetWeapon();
++	CWeapon *locomotionWeapon = unrestrictedLocomotion ?
++		&GetWeapon(WEAPONSLOT_UNARMED) : GetWeapon();
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+ 	// The selected inventory slot is not the weapon Tommy is physically holding
+ 	// in VR.  Rampages select their supplied heavy weapon immediately, so using
+ 	// the selected slot here leaves the player in the heavy/chainsaw locomotion
+ 	// group even while both hands are empty.  Drive the body animation from the
+ 	// actually held item and use the normal unarmed group when it is holstered.
+-	if(OculusVR::IsPhysicalWeaponInteractionActive()){
++	if(!unrestrictedLocomotion && OculusVR::IsPhysicalWeaponInteractionActive()){
+ 		locomotionWeapon = &GetWeapon(WEAPONSLOT_UNARMED);
+ 		for(int hand = 0; hand < 2; hand++){
+ 			const int heldSlot = OculusVR::GetHeldWeaponSlot(hand);
+@@ -2427,6 +2436,8 @@
+ bool
+ CPlayerPed::MovementDisabledBecauseOfTargeting(void)
+ {
++	if(IsRunWithoutLimitsCheatEnabled())
++		return false;
+ 	return m_pPointGunAt && !CWeaponInfo::GetWeaponInfo(GetWeapon()->m_eWeaponType)->IsFlagSet(WEAPONFLAG_CANAIM_WITHARM);
+ }
+ 
+--- a/src/peds/Population.cpp
++++ b/src/peds/Population.cpp
+@@ -28,6 +28,9 @@
+ #include "Streaming.h"
+ #include "Clock.h"
+ #include "WaterLevel.h"
++#ifdef __ANDROID__
++#include "VrRagdoll.h"
++#endif
+ 
+ #define MIN_CREATION_DIST		40.0f // not for start of the game (look at the GeneratePedsAtStartOfGame)
+ #define CREATION_RANGE			10.0f // added over the MIN_CREATION_DIST.
+@@ -100,10 +103,10 @@
+ // a deliberately wider head-facing cone, then use building LOS so a ped safely
+ // hidden around a corner does not consume the visible grace forever.
+ static bool
+-IsVrPedSpotObservable(const CVector &spot, float radius)
++IsVrPedSpotObservable(const CVector &spot, float radius, float targetHeight = 0.9f)
+ {
+ 	CVector target = spot;
+-	target.z += 0.9f;
++	target.z += targetHeight;
+ 	CVector toSpot = target - TheCamera.GetPosition();
+ 	const float distance = toSpot.Magnitude();
+ 	if (distance < 12.0f)
+@@ -121,9 +124,27 @@
+ 		true, false, false, false, false, false);
+ }
+ 
++static CVector
++VrPedSpatialPosition(CPed *ped)
++{
++#ifdef __ANDROID__
++	CVector centre;
++	float radius;
++	return VrRagdoll::GetBounds(ped, centre, radius) ? centre : ped->GetPosition();
++#else
++	return ped->GetPosition();
++#endif
++}
++
+ static bool
+ IsVrPedObservable(CPed *ped)
+ {
++#ifdef __ANDROID__
++	CVector centre;
++	float radius;
++	if(VrRagdoll::GetBounds(ped, centre, radius))
++		return ped->GetIsOnScreen() || IsVrPedSpotObservable(centre, radius, 0.0f);
++#endif
+ 	return ped->GetIsOnScreen() || IsVrPedSpotObservable(ped->GetPosition(), 1.5f);
+ }
+ 
+@@ -1434,7 +1455,11 @@
+ 				continue;
+ 			}
+ 
++#ifdef __ANDROID__
++			float dist = (VrPedSpatialPosition(ped) - playerPos).Magnitude2D();
++#else
+ 			float dist = (ped->GetPosition() - playerPos).Magnitude2D();
++#endif
+ 			bool pedIsFarAway = false;
+ 
+ 			if (ped->IsGangMember())
+@@ -1602,7 +1627,7 @@
+ 					IsVrPedTimerActive(now, ped->m_nExtendedRangeTimer))
+ 					continue;
+ 
+-				const float dist = (TheCamera.GetPosition() - ped->GetPosition()).Magnitude();
++				const float dist = (TheCamera.GetPosition() - VrPedSpatialPosition(ped)).Magnitude();
+ 				if (dist < safeDistance || IsVrPedObservable(ped))
+ 					continue;
+ 
+--- a/src/rw/VisibilityPlugins.cpp
++++ b/src/rw/VisibilityPlugins.cpp
+@@ -17,6 +17,7 @@
+ #include "vulkan/rwvk.h"
+ #ifdef __ANDROID__
+ #include "QuestProfiler.h"
++#include "VrRagdoll.h"
+ #endif
+ #endif
+ 
+@@ -729,7 +730,16 @@
+ 	RwV3d cam2atm;
+ 
+ 	RwV3dSub(&cam2atm, &RwFrameGetLTM(RpAtomicGetFrame(atomic))->pos, ms_pCameraPosn);
+-	if(RwV3dDotProduct(&cam2atm, &cam2atm) < ms_pedLod1Dist){
++	float lodDistanceSq = ms_pedLod1Dist;
++#if defined(__ANDROID__) && defined(RW_VULKAN)
++	CVector centre;
++	float radius;
++	if(VrRagdoll::GetClumpBounds(RpAtomicGetClump(atomic), centre, radius)){
++		cam2atm = centre - CVector(*ms_pCameraPosn);
++		lodDistanceSq = sq(Sqrt(ms_pedLod1Dist) + radius);
++	}
++#endif
++	if(RwV3dDotProduct(&cam2atm, &cam2atm) < lodDistanceSq){
+ 		alpha = GetClumpAlpha(RpAtomicGetClump(atomic));
+ 		if(alpha == 255)
+ 			RENDERCALLBACK(atomic);

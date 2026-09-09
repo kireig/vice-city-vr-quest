@@ -14,7 +14,9 @@
 #   --java-home DIR     / -JavaHome DIR     JDK 21 home
 #   --serial SERIAL     / -Serial SERIAL    Quest USB serial
 #   --log-path PATH     / -LogPath PATH     diagnostic log location
+#   --release           / -Release        release APK with configured signing key
 #   --build-only        / -BuildOnly        stop after producing the APK
+#   --update-only        / -UpdateOnly      update APK only; keep all app data
 #   --skip-game-data    / -SkipGameData     do not copy game data
 #   --non-interactive   / -NonInteractive   never prompt; fail instead
 #   --help              / -h                show this help
@@ -30,6 +32,8 @@ SERIAL=""
 LOG_PATH="${TMPDIR:-/tmp}/ViceCityVR-Build-And-Install.log"
 BUILD_ONLY=0
 SKIP_GAME_DATA=0
+UPDATE_ONLY=0
+RELEASE_BUILD=0
 NON_INTERACTIVE=0
 
 # ---- constants ------------------------------------------------------------
@@ -105,6 +109,8 @@ while [ $# -gt 0 ]; do
     --java-home|-JavaHome)    JAVA_HOME_ARG="$2"; shift 2 ;;
     --serial|-Serial)         SERIAL="$2"; shift 2 ;;
     --log-path|-LogPath)      LOG_PATH="$2"; shift 2 ;;
+    --release|-Release) RELEASE_BUILD=1; shift ;;
+    --update-only|-UpdateOnly) UPDATE_ONLY=1; SKIP_GAME_DATA=1; shift ;;
     --build-only|-BuildOnly)      BUILD_ONLY=1; shift ;;
     --skip-game-data|-SkipGameData) SKIP_GAME_DATA=1; shift ;;
     --non-interactive|-NonInteractive) NON_INTERACTIVE=1; shift ;;
@@ -114,6 +120,10 @@ while [ $# -gt 0 ]; do
     *) die "Unknown argument: $1 (see --help)" ;;
   esac
 done
+
+if [ "$UPDATE_ONLY" -eq 1 ] && [ -e "$REPO_ROOT/tools/update-required-assets.txt" ]; then
+  die "This source version needs updated bundled assets. Use BUILD_AND_INSTALL for that version instead of UPDATE."
+fi
 
 # Re-point the log if --log-path was supplied after the initial redirect.
 if [ "$LOG_PATH" != "${TMPDIR:-/tmp}/ViceCityVR-Build-And-Install.log" ]; then
@@ -247,8 +257,11 @@ get_missing_sdk_packages() {
   [ -f "$sdk_root/platforms/android-35/android.jar" ] || echo "platforms;android-35"
   [ -d "$sdk_root/build-tools/34.0.0" ] || echo "build-tools;34.0.0"
   [ -f "$sdk_root/platform-tools/adb" ] || echo "platform-tools"
-  [ -d "$sdk_root/ndk/$NDK_VERSION" ] || echo "ndk;$NDK_VERSION"
-  [ -d "$sdk_root/cmake/$CMAKE_VERSION" ] || echo "cmake;$CMAKE_VERSION"
+  # The file each component is known by, not the folder: a download that
+  # stopped part way leaves the folder behind, and a folder test then
+  # reports it present and skips the repair.
+  [ -f "$sdk_root/ndk/$NDK_VERSION/source.properties" ] || echo "ndk;$NDK_VERSION"
+  [ -f "$sdk_root/cmake/$CMAKE_VERSION/bin/cmake" ] || echo "cmake;$CMAKE_VERSION"
 }
 
 ensure_sdk_packages() {
@@ -270,7 +283,9 @@ ensure_sdk_packages() {
     [Yy]*|'') ;;
     *) die "Required SDK components were not installed." ;;
   esac
-  yes | checked "Android SDK license step failed" "$sdkmanager" --sdk_root="$sdk_root" --licenses
+  yes | "$sdkmanager" --sdk_root="$sdk_root" --licenses
+  local license_rc=${PIPESTATUS[1]}
+  [ "$license_rc" -eq 0 ] || die "Android SDK license step failed (exit code $license_rc)."
   # shellcheck disable=SC2086
   checked "Android SDK component installation failed" "$sdkmanager" --sdk_root="$sdk_root" $missing
   local still
@@ -387,15 +402,24 @@ find_child_directory() {
   return 1
 }
 
+require_installed_for_update() {
+  local installed
+  installed="$("$ADB" -s "$SERIAL" shell pm path "$PACKAGE_NAME" 2>&1)"
+  [ "$?" -eq 0 ] && printf '%s\n' "$installed" | grep -q '^package:' ||
+    die "UPDATE requires an existing Vice City VR installation. Use BUILD_AND_INSTALL for the first install."
+}
+
 # ---- main -----------------------------------------------------------------
-echo "Vice City VR v0.5.1 - personal Quest build wizard"
+KIT_VERSION="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' "$REPO_ROOT/overlay/android/app/build.gradle.kts")"
+[ -n "$KIT_VERSION" ] || die "Cannot read the source kit version."
+echo "Vice City VR $KIT_VERSION - personal Quest build wizard"
 echo "This repository supplies source/build tooling only; no APK or GTA data is bundled."
 
 step 1 "Preparing Git, JDK 21 and the Android SDK"
-GIT_EXE="$(find_git)"
-RESOLVED_JAVA_HOME="$(find_java_home)"
+GIT_EXE="$(find_git)" || die "Git discovery failed; stopping."
+RESOLVED_JAVA_HOME="$(find_java_home)" || die "JDK discovery or bootstrap failed; stopping."
 export JAVA_HOME="$RESOLVED_JAVA_HOME"
-RESOLVED_SDK="$(find_android_sdk)"
+RESOLVED_SDK="$(find_android_sdk)" || die "Android SDK discovery or bootstrap failed; stopping."
 export ANDROID_HOME="$RESOLVED_SDK"
 export ANDROID_SDK_ROOT="$RESOLVED_SDK"
 ensure_sdk_packages "$RESOLVED_SDK"
@@ -403,6 +427,10 @@ ADB="$RESOLVED_SDK/platform-tools/adb"
 echo "Git: $GIT_EXE"
 echo "JDK: $RESOLVED_JAVA_HOME"
 echo "Android SDK: $RESOLVED_SDK"
+if [ "$UPDATE_ONLY" -eq 1 ] && [ "$BUILD_ONLY" -eq 0 ]; then
+  select_quest_device
+  require_installed_for_update
+fi
 
 step 2 "Preparing the short local build directory"
 RESOLVED_WORK="$(realpath -m -- "$WORK_DIR" 2>/dev/null || printf '%s' "$WORK_DIR")"
@@ -458,14 +486,20 @@ if [ ! -x "$GRADLE_BIN" ]; then
 fi
 [ -x "$GRADLE_BIN" ] || die "Gradle extraction did not create $GRADLE_BIN"
 
-step 6 "Building the personal debug-signed APK"
+BUILD_VARIANT="debug"
+GRADLE_TASK="assembleDebug"
+if [ "$RELEASE_BUILD" -eq 1 ]; then
+  BUILD_VARIANT="release"
+  GRADLE_TASK="assembleRelease"
+fi
+step 6 "Building the personal $BUILD_VARIANT APK"
 (
   cd "$ASSEMBLED_DIR/android"
-  "$GRADLE_BIN" :app:assembleDebug --no-daemon
+  "$GRADLE_BIN" ":app:$GRADLE_TASK" -PmiamivrDevTools=false --no-daemon
 )
 rc=$?
 [ "$rc" -eq 0 ] || die "Android/ARM64 build failed (exit code $rc)."
-APK="$ASSEMBLED_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
+APK="$ASSEMBLED_DIR/android/app/build/outputs/apk/$BUILD_VARIANT/app-$BUILD_VARIANT.apk"
 [ -f "$APK" ] || die "Build completed without the expected APK: $APK"
 APK_HASH="$(sha256sum "$APK" | awk '{print toupper($1)}')"
 echo "APK: $APK"
@@ -480,6 +514,7 @@ fi
 step 7 "Installing on the connected Quest"
 select_quest_device
 echo "Quest: $SERIAL"
+if [ "$UPDATE_ONLY" -eq 1 ]; then require_installed_for_update; fi
 # Build the full adb argv (with -s SERIAL when pinned) and run it, capturing
 # output because a failed install must be inspected, not treated as fatal
 # before the incompatible-signature handling below.
@@ -490,6 +525,9 @@ install_output="$("${adb_argv[@]}" 2>&1)"
 install_rc=$?
 echo "$install_output"
 if [ "$install_rc" -ne 0 ]; then
+  if [ "$UPDATE_ONLY" -eq 1 ]; then
+    die "APK update failed. The existing app and its data were kept; use the same signing key and a non-older version. No uninstall was attempted."
+  fi
   if echo "$install_output" | grep -q 'INSTALL_FAILED_UPDATE_INCOMPATIBLE'; then
     echo ""
     echo "The Quest already contains Vice City VR signed with a different key."
@@ -515,6 +553,12 @@ if [ "$install_rc" -ne 0 ]; then
   else
     die "APK installation failed (exit code $install_rc)."
   fi
+fi
+if [ "$UPDATE_ONLY" -eq 1 ]; then
+  echo "APK updated. Saves, settings, GTA data and bundled assets were left unchanged."
+  echo "The game was not launched."
+  echo "Diagnostic log: $LOG_PATH"
+  exit 0
 fi
 # Run the save-provider bootstrap query with the same device prefix.
 provider_argv=("$ADB")

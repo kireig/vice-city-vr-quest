@@ -9,12 +9,12 @@ enum eModelSet
 {
 	MODEL_SET_CLASSIC = 0,
 	MODEL_SET_MODERN,
+	MODEL_SET_XBOX,
 	MODEL_SET_COUNT
 };
 
-// The Modern overlay can be mixed by asset category.  The whole set is still
-// selected before RenderWare starts, and category changes likewise require a
-// restart; no loaded RenderWare object is ever replaced in place.
+// Overlays can be mixed by category; Xbox is available only for vehicles.
+// Changes require a restart so loaded RenderWare objects are not replaced.
 enum eModelCategory
 {
 	MODEL_CATEGORY_WORLD = 0,
@@ -33,6 +33,7 @@ eModelSet GetRequested();
 void SetRequested(eModelSet modelSet);
 void CycleRequested(int direction);
 bool IsModernActive();
+bool IsXboxActive();
 bool IsRestartRequired();
 bool IsAvailable(eModelSet modelSet);
 const char *GetName(eModelSet modelSet);
@@ -56,13 +57,14 @@ const char *GetCategoryName(eModelCategory category);
 bool HasVegetationManifest();
 bool IsVegetationModel(const char *modelName);
 
-// The mixed loader keeps the legal base GTA3 archive open and overlays only
-// enabled Modern entries from a second image.  These helpers avoid routing the
-// base archive through ResolveAssetPath and identify the overlay image later
-// while its directory is being registered.
+// Keep the base GTA3 archive open and register selected entries from the
+// optional overlays. Missing models retain their base archive entries.
 bool GetModernAssetPath(const char *relativePath, char *resolvedPath,
 	size_t resolvedPathSize);
 bool IsModernAssetPath(const char *path);
+bool GetXboxAssetPath(const char *relativePath, char *resolvedPath,
+	size_t resolvedPathSize);
+bool IsXboxAssetPath(const char *path);
 
 // A Modern install mirrors the original relative layout below
 // modelsets\modern.  Missing files deliberately fall through to the classic
@@ -70,5 +72,4 @@ bool IsModernAssetPath(const char *path);
 const char *ResolveAssetPath(const char *originalPath, char *resolvedPath,
 	size_t resolvedPathSize);
 }
-
 

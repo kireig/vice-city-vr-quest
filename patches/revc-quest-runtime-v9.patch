@@ -1,0 +1,254 @@
+diff --git a/src/core/World.cpp b/src/core/World.cpp
+index 0dacb66..b059d61 100644
+--- a/src/core/World.cpp
++++ b/src/core/World.cpp
+@@ -14,6 +14,7 @@
+ #include "ParticleObject.h"
+ #include "Pickups.h"
+ #include "Population.h"
++#include "VrRagdoll.h"
+ #include "ProjectileInfo.h"
+ #include "Record.h"
+ #include "References.h"
+@@ -365,7 +366,11 @@ CWorld::ProcessLineOfSightSectorList(CPtrList &list, const CColLine &line, CColP
+ 			e->m_scanCode = GetCurrentScanCode();
+ 
+ 			if(e->IsPed()) {
+-				if(e->bUsesCollision || deadPeds && ((CPed *)e)->m_nPedState == PED_DEAD || bikers && ((CPed*)e)->InVehicle() && (((CPed*)e)->m_pMyVehicle->IsBike() || ((CPed*)e)->m_pMyVehicle->IsBoat())) {
++				// Weapon traces resolve owned bodies from their simulated pose.
++				// Other world queries retain the normal animated ped collider.
++				if(VrRagdoll::SkipBulletCollision((CPed*)e))
++					colmodel = nil;
++				else if(e->bUsesCollision || deadPeds && ((CPed *)e)->m_nPedState == PED_DEAD || bikers && ((CPed*)e)->InVehicle() && (((CPed*)e)->m_pMyVehicle->IsBike() || ((CPed*)e)->m_pMyVehicle->IsBoat())) {
+ 					colmodel = ((CPedModelInfo *)CModelInfo::GetModelInfo(e->GetModelIndex()))->AnimatePedColModelSkinned(e->GetClump());
+ 				} else
+ 					colmodel = nil;
+@@ -1983,6 +1988,9 @@ CWorld::Process(void)
+ 		// non-blocking and falls back to the original sector scan on a miss.
+ 		CCarCtrl::BeginVrTrafficJobFrame();
+ #endif
++		// The corpse ragdolls advance on the same clock as everything
++		// else in the frame; paused frames never reach this branch.
++		VrRagdoll::Update();
+ 		for(CPtrNode *node = ms_listMovingEntityPtrs.first; node; node = node->next) {
+ 			CEntity *movingEnt = (CEntity *)node->item;
+ 			if(!movingEnt->bRemoveFromWorld && movingEnt->m_rwObject && RwObjectGetType(movingEnt->m_rwObject) == rpCLUMP &&
+diff --git a/src/peds/Ped.cpp b/src/peds/Ped.cpp
+index a9bb93f..5c82aad 100644
+--- a/src/peds/Ped.cpp
++++ b/src/peds/Ped.cpp
+@@ -19,6 +19,7 @@
+ #include "Weather.h"
+ #include "ZoneCull.h"
+ #include "Population.h"
++#include "VrRagdoll.h"
+ #include "Pad.h"
+ #include "Phones.h"
+ #include "TrafficLights.h"
+@@ -381,6 +382,7 @@ CPed::CPed(uint32 pedType) : m_pedIK(this)
+ 
+ CPed::~CPed(void)
+ {
++	VrRagdoll::Release(this);
+ #ifdef USE_CUTSCENE_SHADOW_FOR_PED
+ 	if ( m_pRTShadow ) delete m_pRTShadow;
+ #endif
+@@ -4784,6 +4786,9 @@ CPed::PreRender(void)
+ 		CTimeCycle::m_fShadowSideX[CTimeCycle::m_CurrentStoredValue], CTimeCycle::m_fShadowSideY[CTimeCycle::m_CurrentStoredValue]);
+ 
+ 	UpdateRpHAnim();
++	// A ragdolled corpse rewrites its world-space bone matrices whole;
++	// the overrides below still compose on top.
++	VrRagdoll::Apply(this);
+ 
+ 	bool bIsWindModifierTurnedOn = false;
+ 	float fAnyDirectionShift = 1.0f;
+@@ -5216,6 +5221,12 @@ CPed::SetFall(int extraTime, AnimationId animId, uint8 evenIfNotInControl)
+ 	ClearAimFlag();
+ 	SetStoredState();
+ 	SetPedState(PED_FALL);
++	// Violent knockdowns -- knockouts, high impacts, car spins, bike
++	// falls -- ragdoll from this very frame; the canned flight below
++	// then plays only for the peds the ragdoll refuses.
++	if ((animId >= ANIM_STD_KO_FRONT && animId <= ANIM_STD_HIGHIMPACT_RIGHT) ||
++	    animId == ANIM_STD_BIKE_FALLOFF || animId == ANIM_STD_BIKE_FALLBACK)
++		VrRagdoll::BeginFall(this);
+ 	CAnimBlendAssociation *fallAssoc = nil;
+ 	if (animId == ANIM_STD_NUM) {
+ 		if (IsPlayer()) {
+@@ -7115,6 +7126,10 @@ CPed::SetDie(AnimationId animId, float delta, float speed)
+ 	}
+ 
+ 	SetPedState(PED_DIE);
++	// The ragdoll owns the fall when it takes the ped; the state machine
++	// runs as ever, only the canned death animation is skipped.
++	if (VrRagdoll::Begin(this))
++		animId = ANIM_STD_NUM;
+ 	if (animId == ANIM_STD_NUM) {
+ 		bIsPedDieAnimPlaying = false;
+ 	} else {
+diff --git a/src/peds/PedFight.cpp b/src/peds/PedFight.cpp
+index b994cc9..35eb699 100644
+--- a/src/peds/PedFight.cpp
++++ b/src/peds/PedFight.cpp
+@@ -7,6 +7,7 @@
+ #include "Camera.h"
+ #include "CarCtrl.h"
+ #include "Darkel.h"
++#include "VrRagdoll.h"
+ #include "DMAudio.h"
+ #include "FileMgr.h"
+ #include "General.h"
+@@ -3616,6 +3617,7 @@ CPed::CollideWithPed(CPed *collideWith)
+ void
+ CPed::KillPedWithCar(CVehicle *car, float impulse)
+ {
++	const CVector incomingRagdollSpeed = m_vecMoveSpeed;
+ 	CVehicleModelInfo *vehModel;
+ 	CColModel *vehColModel;
+ 	uint8 damageDir;
+@@ -3832,12 +3834,17 @@ CPed::KillPedWithCar(CVehicle *car, float impulse)
+ 			m_vecMoveSpeed = car->m_vecMoveSpeed * 0.75f;
+ 		}
+ 		m_vecMoveSpeed.z = 0.0f;
++		// The knockdown itself ragdolls, with the launch speed set just
++		// above; the canned flight only plays when this refuses the ped.
++		VrRagdoll::BeginFall(this);
+ 		distVec.Normalise();
+ 		distVec *= Min(car->m_fMass / 1400.0f, 1.0f);
+ 		car->ApplyMoveForce(distVec * -60.0f);
+ 		Say(SOUND_PED_DEFEND);
+ 	}
+ 
++	if(car->IsCar() && !car->IsRealHeli() && !car->IsRealPlane())
++		VrRagdoll::VehicleImpact(this, car, incomingRagdollSpeed, impulse);
+ 	if (IsGangMember()) {
+ 		CPed *driver = car->pDriver;
+ 		if (driver && driver->IsPlayer()
+diff --git a/src/weapons/BulletInfo.cpp b/src/weapons/BulletInfo.cpp
+index b49db74..1520d8c 100644
+--- a/src/weapons/BulletInfo.cpp
++++ b/src/weapons/BulletInfo.cpp
+@@ -21,6 +21,7 @@
+ #include "Vehicle.h"
+ #include "Weapon.h"
+ #include "WeaponInfo.h"
++#include "VrRagdoll.h"
+ #include "World.h"
+ #include "SurfaceTable.h"
+ #include "Heli.h"
+@@ -123,7 +124,8 @@ void CBulletInfo::Update(void)
+ 		CWorld::pIgnoreEntity = pBullet->m_pSource;
+ 		CColPoint point;
+ 		CEntity* pHitEntity;
+-		if (CWorld::ProcessLineOfSight(vecOldPos, vecNewPos, point, pHitEntity, true, true, true, true, true, false, false, true)) {
++		if (CWeapon::ProcessLineOfSight(vecOldPos, vecNewPos, point, pHitEntity,
++			pBullet->m_eWeaponType, pBullet->m_pSource, true, true, true, true, true, false, false)) {
+ 
+ 			CWeapon::CheckForShootingVehicleOccupant(&pHitEntity, &point, pBullet->m_eWeaponType, vecOldPos, vecNewPos);
+ 			if (pHitEntity->IsPed()) {
+@@ -139,6 +141,15 @@ void CBulletInfo::Update(void)
+ 					pBullet->m_bInUse = false;
+ #ifdef SQUEEZE_PERFORMANCE
+ 					bulletInfoInUse--;
++#endif
++					vecNewPos = point.point;
++				}
++				else if(VrRagdoll::Owns(pPed) && !CGame::nastyGame){
++					// The gore branch below normally retires corpse hits. Do it
++					// here too when gore is disabled, once per travelling round.
++					pBullet->m_bInUse = false;
++#ifdef SQUEEZE_PERFORMANCE
++					bulletInfoInUse--;
+ #endif
+ 					vecNewPos = point.point;
+ 				}
+@@ -149,7 +160,7 @@ void CBulletInfo::Update(void)
+ 						for (int j = 0; j < NUM_PED_BLOOD_PARTICLES; j++)
+ 							CParticle::AddParticle(PARTICLE_BLOOD_SMALL, point.point + BLOOD_PARTICLE_OFFSET, vecParticleDirection);
+ 					}
+-					if (pPed->GetPedState() == PED_DEAD) {
++					if (pPed->GetPedState() == PED_DEAD && !VrRagdoll::Owns(pPed)) {
+ 						CAnimBlendAssociation* pAnim;
+ 						if (RpAnimBlendClumpGetFirstAssociation(pPed->GetClump(), ASSOC_FRONTAL))
+ 							pAnim = CAnimManager::BlendAnimation(pPed->GetClump(), ASSOCGRP_STD, ANIM_STD_HIT_FLOOR_FRONT, 8.0f);
+diff --git a/src/weapons/Weapon.cpp b/src/weapons/Weapon.cpp
+index ca75e53..b139b34 100644
+--- a/src/weapons/Weapon.cpp
++++ b/src/weapons/Weapon.cpp
+@@ -27,6 +27,7 @@
+ #include "Timer.h"
+ #include "Automobile.h"
+ #include "Boat.h"
++#include "VrRagdoll.h"
+ #include "WaterLevel.h"
+ #include "WeaponInfo.h"
+ #include "World.h"
+@@ -1586,7 +1587,7 @@ CWeapon::DoBulletImpact(CEntity *shooter, CEntity *victim,
+ 							CParticle::AddParticle(PARTICLE_BLOOD_SMALL, point->point + CVector(0.0f, 0.0f, 0.15f), dir);
+ 					}
+ 
+-					if ( victimPed->Dead() )
++					if ( victimPed->Dead() && !VrRagdoll::Owns(victimPed) )
+ 					{
+ 						CAnimBlendAssociation *asoc;
+ 						if ( RpAnimBlendClumpGetFirstAssociation(victimPed->GetClump(), ASSOC_FRONTAL) )
+@@ -2033,7 +2034,7 @@ CWeapon::FireShotgun(CEntity *shooter, CVector *fireSource)
+ 							for (uint8 i = 0; i < 8; i++)
+ 								CParticle::AddParticle(PARTICLE_BLOOD_SMALL, point.point + CVector(0.0f, 0.0f, 0.15f), dir);
+ 						}
+-						if (victimPed->Dead())
++						if (victimPed->Dead() && !VrRagdoll::Owns(victimPed))
+ 						{
+ 							CAnimBlendAssociation *hitAssoc;
+ 							if (RpAnimBlendClumpGetFirstAssociation(victimPed->GetClump(), ASSOC_FRONTAL))
+@@ -3292,7 +3293,8 @@ FireOneInstantHitRound(CVector *source, CVector *target, int32 damage)
+ 
+ 	CColPoint point;
+ 	CEntity *victim;
+-	CWorld::ProcessLineOfSight(*source, *target, point, victim, true, true, true, true, true, true, false);
++	CWeapon::ProcessLineOfSight(*source, *target, point, victim, WEAPONTYPE_UZI, nil,
++		true, true, true, true, true, true, false);
+ 
+ 	CParticle::AddParticle(PARTICLE_HELI_ATTACK, *source, ((*target) - (*source)) * 0.15f);
+ 
+@@ -3532,7 +3534,38 @@ CPed::IsPedDoingDriveByShooting(void)
+ bool
+ CWeapon::ProcessLineOfSight(CVector const &point1, CVector const &point2, CColPoint &point, CEntity *&entity, eWeaponType type, CEntity *shooter, bool checkBuildings, bool checkVehicles, bool checkPeds, bool checkObjects, bool checkDummies, bool ignoreSeeThrough, bool ignoreSomeObjects)
+ {
+-	return CWorld::ProcessLineOfSight(point1, point2, point, entity, checkBuildings, checkVehicles, checkPeds, checkObjects, checkDummies, false, ignoreSomeObjects, true);
++	const bool previousTrace = VrRagdoll::SetBulletTrace(true);
++	bool hit = CWorld::ProcessLineOfSight(point1, point2, point, entity, checkBuildings, checkVehicles, checkPeds, checkObjects, checkDummies, ignoreSeeThrough, ignoreSomeObjects, true);
++	VrRagdoll::SetBulletTrace(previousTrace);
++	if(checkPeds){
++		CColPoint ragdollPoint = {};
++		CPed *ped = VrRagdoll::BulletHit(point1, hit ? point.point : point2,
++			type, ragdollPoint, shooter);
++		if(ped){
++			point = ragdollPoint;
++			entity = ped;
++			return true;
++		}
++		// Admit a stock corpse only after ruling out a nearer owned body.
++		// Retrace past its old animation collider so geometry behind it
++		// still bounds the newly admitted body's visible-pose query.
++		if(hit && entity && entity->IsPed()){
++			ped = (CPed*)entity;
++			if(ped->DyingOrDead() && !VrRagdoll::Owns(ped) && VrRagdoll::Begin(ped)){
++				VrRagdoll::SetBulletTrace(true);
++				hit = CWorld::ProcessLineOfSight(point1, point2, point, entity, checkBuildings, checkVehicles, checkPeds, checkObjects, checkDummies, ignoreSeeThrough, ignoreSomeObjects, true);
++				VrRagdoll::SetBulletTrace(previousTrace);
++				ped = VrRagdoll::BulletHit(point1, hit ? point.point : point2,
++					type, ragdollPoint, shooter);
++				if(ped){
++					point = ragdollPoint;
++					entity = ped;
++					return true;
++				}
++			}
++		}
++	}
++	return hit;
+ }
+ 
+ 

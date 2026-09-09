@@ -10,7 +10,7 @@ class CVehicle;
 
 // Single source of truth for the build name shown to players: the flat main
 // menu, the VR About page and the APK version must never disagree again.
-#define MIAMIVR_VERSION_TEXT "0.5.5.1"
+#define MIAMIVR_VERSION_TEXT "0.5.6"
 
 namespace OculusVR
 {
@@ -154,6 +154,13 @@ bool IsImmersiveCarDrivingActive();
 bool IsImmersiveBikeDrivingActive();
 bool IsVrCarDrivingActive();
 bool IsVrBikeDrivingActive();
+#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
+// Current button shot: -1 inactive, 0 forward, 1 left, 2 right.
+int GetQuestVehicleButtonFireDirection(CVehicle *vehicle);
+bool IsQuestVehicleForwardFireEnabled();
+void SetQuestVehicleForwardFireEnabled(bool enabled);
+void ApplyQuestVehicleButtonInput(CControllerState *state, bool blocked);
+#endif
 bool IsVrRadioControlActive();
 bool ConsumeVrRadioChange();
 bool GetImmersiveCarSteering(CVehicle *car, float *steering);

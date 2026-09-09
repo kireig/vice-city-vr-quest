@@ -1,0 +1,344 @@
+--- a/src/core/CdStreamPosix.cpp
++++ b/src/core/CdStreamPosix.cpp
+@@ -107,7 +107,7 @@
+ 	int32 hFile;
+ };
+ 
+-char gCdImageNames[MAX_CDIMAGES+1][64];
++char gCdImageNames[MAX_CDIMAGES+1][1024];
+ int32 gNumImages;
+ int32 gNumChannels;
+ 
+@@ -556,6 +556,8 @@
+ 	if(resolveModelSet)
+ 		path = ModelSets::ResolveAssetPath(path, modelSetPath,
+ 			sizeof(modelSetPath));
++	if(gNumImages >= MAX_CDIMAGES || strlen(path) >= sizeof(gCdImageNames[0]))
++		return false;
+ 
+ 	gImgFiles[gNumImages] = open(path, _gdwCdStreamFlags);
+ 	const int directErrno = gImgFiles[gNumImages] == -1 ? errno : 0;
+@@ -624,13 +626,16 @@
+ {
+ 	if(!CdStreamAddImagePath(basePath, true))
+ 		return false;
+-	if(!ModelSets::IsModernActive())
+-		return true;
+-	char modernPath[1024];
+-	if(!ModelSets::GetModernAssetPath("models/gta3.img", modernPath,
+-	   sizeof(modernPath)))
+-		return true;
+-	return CdStreamAddImagePath(modernPath, false);
++	char overlayPath[1024];
++	if(ModelSets::IsModernActive() &&
++	   ModelSets::GetModernAssetPath("models/gta3.img", overlayPath, sizeof(overlayPath)) &&
++	   !CdStreamAddImagePath(overlayPath, false))
++		return false;
++	if(ModelSets::IsXboxActive() &&
++	   ModelSets::GetXboxAssetPath("models/gta3.img", overlayPath, sizeof(overlayPath)) &&
++	   !CdStreamAddImagePath(overlayPath, false))
++		return false;
++	return true;
+ }
+ 
+ char *
+--- a/src/core/FileLoader.cpp
++++ b/src/core/FileLoader.cpp
+@@ -99,13 +99,9 @@
+ 			LoadCollisionFile(line+10, 0);
+ 		}else if(strncmp(line, "MODELFILE", 9) == 0){
+ 			LoadingScreenLoadingFile(line + 10);
+-			// The Modern wheel model has to bind against a freshly loaded wheel
+-			// TXD, not merely against a dictionary that holds the names.  A model
+-			// loaded earlier can leave same-named dummy textures with zero-sized
+-			// rasters behind, and RenderWare keeps those white dummies in every
+-			// cloned wheel.  Loading the model while the wheel TXD is current
+-			// makes the material pointers independent of default.dat ordering.
+-			if(ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_VEHICLES) &&
++			// Bind overlay wheels to fresh textures; earlier models may have left
++			// same-named dummy rasters in the startup dictionary.
++			if((ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_VEHICLES) || ModelSets::IsXboxActive()) &&
+ 			   CGeneral::faststricmp(GetFilename(line + 10), "WHEELS.DFF") == 0){
+ 				static const char *wheelTextureNames[] = {
+ 					"alloy", "classic", "lighttruck", "lightvan", "offroad",
+@@ -113,21 +109,24 @@
+ 				};
+ 				RwTexDictionary *wheelTxd = LoadTexDictionary("MODELS\\GENERIC\\WHEELS.TXD");
+ 				int32 present = 0;
+-				for(size_t i = 0; i < ARRAY_SIZE(wheelTextureNames); i++){
+-					RwTexture *texture = RwTexDictionaryFindNamedTexture(wheelTxd,
+-						wheelTextureNames[i]);
+-					RwRaster *raster = texture ? RwTextureGetRaster(texture) : nil;
+-					if(raster && RwRasterGetWidth(raster) > 0 &&
+-					   RwRasterGetHeight(raster) > 0)
+-						present++;
++				if(ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_VEHICLES)){
++					for(size_t i = 0; i < ARRAY_SIZE(wheelTextureNames); i++){
++						RwTexture *texture = RwTexDictionaryFindNamedTexture(wheelTxd,
++							wheelTextureNames[i]);
++						RwRaster *raster = texture ? RwTextureGetRaster(texture) : nil;
++						if(raster && RwRasterGetWidth(raster) > 0 &&
++						   RwRasterGetHeight(raster) > 0)
++							present++;
++					}
+ 				}
+ 				RwTexDictionarySetCurrent(wheelTxd);
+ 				LoadModelFile(line + 10);
+ 				RwTexDictionarySetCurrent(savedTxd);
+ 				AddTexDictionaries(savedTxd, wheelTxd);
+ 				RwTexDictionaryDestroy(wheelTxd);
+-				printf("Modern wheel textures: %d/%d usable before WHEELS.DFF\n",
+-					present, (int32)ARRAY_SIZE(wheelTextureNames));
++				if(ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_VEHICLES))
++					printf("Modern wheel textures: %d/%d usable before WHEELS.DFF\n",
++						present, (int32)ARRAY_SIZE(wheelTextureNames));
+ 			}else
+ 				LoadModelFile(line + 10);
+ 		}else if(strncmp(line, "HIERFILE", 8) == 0){
+--- a/src/core/Streaming.cpp
++++ b/src/core/Streaming.cpp
+@@ -478,11 +478,29 @@
+ 	return ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_WORLD);
+ }
+ 
++static bool
++ShouldUseXboxArchiveEntry(const char *extension, int modelId)
++{
++	if(!ModelSets::IsXboxActive())
++		return false;
++	if(strncasecmp(extension, "DFF", 3) == 0)
++		return GetModelSetCategory(modelId) == ModelSets::MODEL_CATEGORY_VEHICLES;
++	if(strncasecmp(extension, "TXD", 3) == 0){
++		for(int i = 0; i < MODELINFOSIZE; i++){
++			CBaseModelInfo *model = CModelInfo::GetModelInfo(i);
++			if(model && model->GetModelType() == MITYPE_VEHICLE &&
++			   model->GetTxdSlot() == modelId-STREAM_OFFSET_TXD)
++				return true;
++		}
++	}
++	return false;
++}
++
+ void
+ CStreaming::LoadCdDirectory(const char *dirname, int n)
+ {
+ 	int fd, lastID, imgSelector;
+-	int modelId;
++	int modelId = -1;
+ 	CDirectory::DirectoryInfo direntry;
+ 	char *dot;
+ 
+@@ -490,6 +508,7 @@
+ 	fd = CFileMgr::OpenFile(dirname, "rb");
+ 	assert(fd > 0);
+ 	const bool modernArchive = ModelSets::IsModernAssetPath(dirname);
++	const bool xboxArchive = ModelSets::IsXboxAssetPath(dirname);
+ 
+ 	imgSelector = n<<24;
+ 	assert(sizeof(direntry) == 32);
+@@ -507,15 +526,20 @@
+ 		}
+ 
+ 		*dot = '\0';
++		if(xboxArchive && strncasecmp(dot+1, "DFF", 3) != 0 &&
++		   strncasecmp(dot+1, "TXD", 3) != 0){
++			lastID = -1;
++			continue;
++		}
+ 
+ 		if(strncasecmp(dot+1, "DFF", 3) == 0){
+ 			if(CModelInfo::GetModelInfo(direntry.name, &modelId)){
+ 				bAddToStreaming = true;
+ 			}else{
+-				if(modernArchive &&
++				if(xboxArchive || (modernArchive &&
+ 				   (!ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_WORLD) ||
+ 				    (!ModelSets::HasVegetationManifest() &&
+-				     !ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_VEGETATION)))){
++				     !ModelSets::IsCategoryModernActive(ModelSets::MODEL_CATEGORY_VEGETATION))))){
+ 					lastID = -1;
+ 					continue;
+ 				}
+@@ -560,7 +584,8 @@
+ 		}
+ 
+ 		if(bAddToStreaming){
+-			if(modernArchive && !ShouldUseModernArchiveEntry(dot+1, modelId)){
++			if((modernArchive && !ShouldUseModernArchiveEntry(dot+1, modelId)) ||
++			   (xboxArchive && !ShouldUseXboxArchiveEntry(dot+1, modelId))){
+ 				lastID = -1;
+ 				continue;
+ 			}
+@@ -570,13 +595,14 @@
+ 					existingImage < (uint32)CdStreamGetNumImages() ?
+ 					CdStreamGetImageName(existingImage) : nil;
+ 				const bool existingIsModern = ModelSets::IsModernAssetPath(existingImageName);
+-				if(modernArchive){
++				const bool existingIsXbox = ModelSets::IsXboxAssetPath(existingImageName);
++				if(xboxArchive || (modernArchive && !existingIsXbox)){
+ 					direntry.offset |= imgSelector;
+ 					ms_aInfoForModel[modelId].SetCdPosnAndSize(direntry.offset, direntry.size);
+ 					lastID = -1;
+ 					continue;
+ 				}
+-				if(existingIsModern){
++				if(existingIsModern || existingIsXbox){
+ 					lastID = -1;
+ 					continue;
+ 				}
+--- a/src/core/World.cpp
++++ b/src/core/World.cpp
+@@ -2350,6 +2350,9 @@
+ CWorld::TriggerExplosion(const CVector &position, float fRadius, float fPower, CEntity *pCreator,
+                          bool bProcessVehicleBombTimer)
+ {
++#ifdef GTA_VR_WEAPONS
++	if(VrRagdoll::IsEnabled()) VrRagdoll::ExplosionImpulse(position,fRadius,fPower);
++#endif
+ 	CVector2D vecStartPos(position.x - fRadius, position.y - fRadius);
+ 	CVector2D vecEndPos(position.x + fRadius, position.y + fRadius);
+ 	const int32 nStartX = Max(GetSectorIndexX(vecStartPos.x), 0);
+--- a/src/vehicles/Automobile.cpp
++++ b/src/vehicles/Automobile.cpp
+@@ -3944,12 +3944,17 @@
+ CAutomobile::DoDriveByShootings(void)
+ {
+ 	CAnimBlendAssociation *anim = nil;
++#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++	const int questButtonDirection = OculusVR::GetQuestVehicleButtonFireDirection(this);
++#else
++	const int questButtonDirection = -1;
++#endif
+ 	CPlayerInfo* playerInfo = ((CPlayerPed*)pDriver)->GetPlayerInfoForThisPlayerPed();
+ 	if (playerInfo && !playerInfo->m_bDriveByAllowed)
+ 		return;
+ 
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+-	if(OculusVR::IsVrCarDrivingActive()){
++	if(OculusVR::IsVrCarDrivingActive() && questButtonDirection < 0){
+ 		CPlayerPed *player = (CPlayerPed*)pDriver;
+ 		const uint32 now = CTimer::GetTimeInMilliseconds();
+ 		for(int hand = 0; hand < 2; hand++){
+@@ -3993,8 +3998,7 @@
+ 						weaponInfo->m_nFiringRate : (uint32)70);
+ 			}
+ 		}
+-		// A free hand aims independently while the other remains attached to the
+-		// physical wheel. Never enter Tommy's animation-driven drive-by path.
++		// A tracked weapon already owns this shot and its aim.
+ 		return;
+ 	}
+ #endif
+@@ -4007,6 +4011,7 @@
+ 
+ 	bool lookingLeft = false;
+ 	bool lookingRight = false;
++	const bool lookingForward = questButtonDirection == 0;
+ 	if(TheCamera.Cams[TheCamera.ActiveCam].Mode == CCam::MODE_TOPDOWN ||
+ 	   TheCamera.m_bObbeCinematicCarCamOn){
+ 		if(CPad::GetPad(0)->GetLookLeft())
+@@ -4019,6 +4024,10 @@
+ 		if(TheCamera.Cams[TheCamera.ActiveCam].LookingRight)
+ 			lookingRight = true;
+ 	}
++	if(questButtonDirection >= 0){
++		lookingLeft = questButtonDirection == 1;
++		lookingRight = questButtonDirection == 2;
++	}
+ 
+ 	AnimationId rightAnim = ANIM_STD_CAR_DRIVEBY_RIGHT;
+ 	AnimationId leftAnim = ANIM_STD_CAR_DRIVEBY_LEFT;
+@@ -4027,8 +4036,13 @@
+ 		leftAnim = ANIM_STD_CAR_DRIVEBY_LEFT_LO;
+ 	}
+ 
+-	if(lookingLeft || lookingRight){
+-		if(lookingLeft){
++	if(lookingLeft || lookingRight || lookingForward){
++		if(lookingForward){
++			CAnimBlendAssociation *sideAnim = RpAnimBlendClumpGetAssociation(pDriver->GetClump(), leftAnim);
++			if(sideAnim) sideAnim->blendDelta = -1000.0f;
++			sideAnim = RpAnimBlendClumpGetAssociation(pDriver->GetClump(), rightAnim);
++			if(sideAnim) sideAnim->blendDelta = -1000.0f;
++		}else if(lookingLeft){
+ 			anim = RpAnimBlendClumpGetAssociation(pDriver->GetClump(), rightAnim);
+ 			if(anim)
+ 				anim->blendDelta = -1000.0f;
+@@ -4046,8 +4060,9 @@
+ 
+ 		if (!anim || !anim->IsRunning()) {
+ 			if (CPad::GetPad(0)->GetCarGunFired() && CTimer::GetTimeInMilliseconds() > weapon->m_nTimer) {
+-				weapon->FireFromCar(this, lookingLeft, true);
+-				weapon->m_nTimer = CTimer::GetTimeInMilliseconds() + 70;
++				weapon->FireFromCar(this, lookingLeft, !lookingForward);
++				if(questButtonDirection < 0 || weapon->m_eWeaponState != WEAPONSTATE_RELOADING)
++					weapon->m_nTimer = CTimer::GetTimeInMilliseconds() + 70;
+ 			}
+ 		}
+ 	}else{
+--- a/src/vehicles/Bike.cpp
++++ b/src/vehicles/Bike.cpp
+@@ -2106,12 +2106,17 @@
+ CBike::DoDriveByShootings(void)
+ {
+ 	CAnimBlendAssociation *anim;
++#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++	const int questButtonDirection = OculusVR::GetQuestVehicleButtonFireDirection(this);
++#else
++	const int questButtonDirection = -1;
++#endif
+ 	CPlayerInfo* playerInfo = ((CPlayerPed*)pDriver)->GetPlayerInfoForThisPlayerPed();
+ 	if (playerInfo && !playerInfo->m_bDriveByAllowed)
+ 		return;
+ 
+ #if defined(GTA_VR_OCULUS) || defined(GTA_VR_WEAPONS)
+-	if(OculusVR::IsVrBikeDrivingActive()){
++	if(OculusVR::IsVrBikeDrivingActive() && questButtonDirection < 0){
+ 		CPlayerPed *player = (CPlayerPed*)pDriver;
+ 		const uint32 now = CTimer::GetTimeInMilliseconds();
+ 		for(int hand = 0; hand < 2; hand++){
+@@ -2155,9 +2160,7 @@
+ 						weaponInfo->m_nFiringRate : (uint32)70);
+ 			}
+ 		}
+-		// Immersive mode never falls through to the animation-driven left/right
+-		// drive-by. A free controller can therefore remain on the handlebar while
+-		// the other hand aims independently.
++		// A tracked weapon already owns this shot and its aim.
+ 		return;
+ 	}
+ #endif
+@@ -2181,6 +2184,10 @@
+ 			lookingLeft = true;
+ 		if(TheCamera.Cams[TheCamera.ActiveCam].LookingRight)
+ 			lookingRight = true;
++	}
++	if(questButtonDirection >= 0){
++		lookingLeft = questButtonDirection == 1;
++		lookingRight = questButtonDirection == 2;
+ 	}
+ 
+ 	if(lookingLeft || lookingRight || CPad::GetPad(0)->GetCarGunFired()){
+@@ -2219,7 +2226,8 @@
+ 		if (!anim || !anim->IsRunning()) {
+ 			if (CPad::GetPad(0)->GetCarGunFired() && CTimer::GetTimeInMilliseconds() > weapon->m_nTimer) {
+ 				weapon->FireFromCar(this, lookingLeft, lookingRight);
+-				weapon->m_nTimer = CTimer::GetTimeInMilliseconds() + 70;
++				if(questButtonDirection < 0 || weapon->m_eWeaponState != WEAPONSTATE_RELOADING)
++					weapon->m_nTimer = CTimer::GetTimeInMilliseconds() + 70;
+ 			}
+ 		}
+ 	}else{
+--- a/src/weapons/Weapon.cpp
++++ b/src/weapons/Weapon.cpp
+@@ -2845,6 +2845,10 @@
+ 		
+ 		if ( left )
+ 			target = source - info->m_fRange * shooter->GetRight();
++#if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
++		else if(!right && OculusVR::GetQuestVehicleButtonFireDirection(shooter) == 0)
++			target = source + info->m_fRange * shooter->GetForward();
++#endif
+ 		else
+ 			target = source + info->m_fRange * shooter->GetRight();
+ 	}

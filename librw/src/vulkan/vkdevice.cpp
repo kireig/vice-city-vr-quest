@@ -2320,6 +2320,12 @@ beginFrame(VkImage colourImage, VkImageView colourView)
 	       sizeof(scene->waterParams1));
 	memcpy(scene->waterParams2, gvk.waterParams+4,
 	       sizeof(scene->waterParams2));
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+	scene->vizParams[0] = gvk.debugVizActive ? 1.0f : 0.0f;
+	scene->vizParams[1] = 0.0f;
+	scene->vizParams[2] = 0.0f;
+	scene->vizParams[3] = 0.0f;
+#endif
 	if(!reflectionHistoryValid)
 		scene->waterParams1[3] = 0.0f;
 	// Under the previous frame's camera fold for now; the first beginUpdate of
@@ -2877,6 +2883,20 @@ setIm3DWater(bool32 water)
 {
 	gvk.im3dWaterDraw = water;
 }
+
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+void
+setDebugVizActive(bool32 active)
+{
+	gvk.debugVizActive = active;
+}
+
+void
+setDebugTint(uint32 index)
+{
+	gvk.debugTint = index;
+}
+#endif
 
 void
 setWaterParams(float32 waves, float32 speed, float32 distortion,

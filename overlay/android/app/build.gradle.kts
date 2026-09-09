@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.io.File
 import org.gradle.api.DefaultTask
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.RegularFileProperty
@@ -31,16 +32,23 @@ plugins {
 
 val questNdkVersion = "27.2.12479018"
 
-// Optional out-of-tree build location.  This is useful on Windows machines
-// where antivirus/indexing software transiently locks generated AGP jars in
-// the source tree.  Normal builds keep Gradle's default app/build directory.
+// Developer tools require an explicit invocation: -PmiamivrDevTools=true.
+// Debug APK packaging and native debug symbols are independent of this flag.
+val questDeveloperTools = providers.gradleProperty("miamivrDevTools").orNull == "true"
+// Build an unsigned release artifact explicitly; signing can happen outside the source tree.
+val questUnsignedRelease = providers.gradleProperty("miamivrUnsignedRelease").orNull == "true"
+
+// Optional external build directory; defaults to app/build.
 System.getenv("MIAMIVR_ANDROID_BUILD_DIR")
 	?.takeIf { it.isNotBlank() }
 	?.let { layout.buildDirectory.set(file(it)) }
 
-val releaseSigningPropertiesFile = rootProject.file("release-signing.properties")
+val releaseSigningPropertiesFile = System.getenv("MIAMIVR_RELEASE_SIGNING_PROPERTIES")
+	?.takeIf { it.isNotBlank() }
+	?.let { file(it) }
+	?: rootProject.file("release-signing.properties")
 val releaseSigningProperties = Properties()
-if (releaseSigningPropertiesFile.isFile) {
+if (!questUnsignedRelease && releaseSigningPropertiesFile.isFile) {
 	releaseSigningPropertiesFile.inputStream().use {
 		releaseSigningProperties.load(it)
 	}
@@ -58,11 +66,13 @@ val hasReleaseSigning = releaseSigningKeys.all {
 val releaseBuildRequested = gradle.startParameter.taskNames.any {
 	it.contains("Release", ignoreCase = true)
 }
-if (releaseBuildRequested && !hasReleaseSigning) {
+if (releaseBuildRequested && !questUnsignedRelease && !hasReleaseSigning) {
 	throw GradleException(
 		"Release signing is not configured. Copy " +
 			"release-signing.properties.example to release-signing.properties " +
-			"and provide the private Quest release keystore values."
+			"and provide the private Quest release keystore values, set " +
+			"MIAMIVR_RELEASE_SIGNING_PROPERTIES to an external config, or use " +
+			"-PmiamivrUnsignedRelease=true for an unsigned artifact."
 	)
 }
 
@@ -76,8 +86,8 @@ android {
 		// Quest 3 / 3S ship Android 12L or newer. Nothing below that is a target.
 		minSdk = 32
 		targetSdk = 35
-		versionCode = 506
-		versionName = "0.5.5.1"
+		versionCode = 522
+		versionName = "0.5.6"
 
 		ndk {
 			abiFilters += "arm64-v8a"
@@ -90,21 +100,13 @@ android {
 					// editing the default in CMakeLists.txt does not change an
 					// already-configured build tree.
 					"-DMIAMIVR_BRINGUP=OFF",
-					// The gradle debug build type configures CMake as Debug,
-					// which compiles at -O0. The game then holds ~60 of the
-					// 72 Hz the headset wants and every miss reads as the
-					// world lurching forward. Optimised code with debug info
-					// is what this stage actually needs.
+					"-DMIAMIVR_DEV_TOOLS=${if (questDeveloperTools) "ON" else "OFF"}",
+					// Native optimization is independent of APK debuggability.
 					"-DCMAKE_BUILD_TYPE=RelWithDebInfo",
-					// ASan found the palette double-free and is done. Off: it
-					// costs half the CPU and gigabytes of shadow memory, and
-					// the device rebooted under combined load once.
+					// Sanitizer runtimes are excluded from normal Quest packages.
 					"-DMIAMIVR_ASAN=OFF",
 					"-DANDROID_STL=c++_shared",
-					// reVC is 2003-era C++ read through a 2024 clang. The
-					// original code relies on things clang now diagnoses by
-					// default; treating them as errors would stop the port
-					// before any of it can be evaluated on the device.
+					// Legacy engine code requires both C++ runtime features.
 					"-DANDROID_CPP_FEATURES=exceptions rtti"
 				)
 				cppFlags += listOf("-std=c++17")
@@ -125,9 +127,7 @@ android {
 
 	packaging {
 		jniLibs {
-			// Kept true: switching to embedded libs on top of an existing
-			// install fails with INSTALL_FAILED_INVALID_APK, and uninstalling
-			// would wipe the staged game data. Revisit on a clean device.
+			// Preserve extracted native libraries for update compatibility.
 			useLegacyPackaging = true
 			// Prefab also contributes this library. Keep exactly one copy even
 			// when a clean/incremental build resolves both inputs.
@@ -137,9 +137,7 @@ android {
 			// copy so cached/reused libmiamivr.so builds cannot produce an APK
 			// without its runtime dependency.
 			pickFirsts += "**/libc++_shared.so"
-			// ASan is intentionally disabled for public builds.  The runtime
-			// remains in the source tree for dedicated diagnostics, but must
-			// not be shipped in a normal SideQuest APK.
+			// Diagnostic ASan libraries must not enter player packages.
 			excludes += "**/libclang_rt.asan-*-android.so"
 		}
 		resources {
@@ -153,12 +151,14 @@ android {
 			isMinifyEnabled = false
 		}
 		release {
+			isDebuggable = false
+			isJniDebuggable = false
 			isMinifyEnabled = false
-			if (hasReleaseSigning) {
+			if (!questUnsignedRelease && hasReleaseSigning) {
 				signingConfig = signingConfigs.create("questRelease") {
-					storeFile = rootProject.file(
-						releaseSigningProperties.getProperty("storeFile")
-					)
+					storeFile = File(releaseSigningProperties.getProperty("storeFile")).let {
+						if (it.isAbsolute) it else File(releaseSigningPropertiesFile.parentFile, it.path)
+					}
 					storePassword = releaseSigningProperties.getProperty(
 						"storePassword"
 					)

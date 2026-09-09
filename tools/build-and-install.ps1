@@ -10,7 +10,9 @@ param(
     [string]$Serial,
     [string]$LogPath = (Join-Path $env:TEMP "ViceCityVR-Build-And-Install.log"),
     [switch]$BuildOnly,
+    [switch]$Release,
     [switch]$SkipGameData,
+    [switch]$UpdateOnly,
     [switch]$NonInteractive
 )
 
@@ -233,8 +235,13 @@ function Get-MissingSdkPackages {
         [PSCustomObject]@{ Path = "platforms\android-35\android.jar"; Package = "platforms;android-35" },
         [PSCustomObject]@{ Path = "build-tools\34.0.0"; Package = "build-tools;34.0.0" },
         [PSCustomObject]@{ Path = "platform-tools\adb.exe"; Package = "platform-tools" },
-        [PSCustomObject]@{ Path = "ndk\$ndkVersion"; Package = "ndk;$ndkVersion" },
-        [PSCustomObject]@{ Path = "cmake\$cmakeVersion"; Package = "cmake;$cmakeVersion" }
+        # The file each component is known by, not the folder. A download
+        # that stopped part way leaves the folder behind; a folder test
+        # then reports the component present, the wizard skips it, and
+        # the build fails much later with CXX1101 naming the very
+        # source.properties that never arrived.
+        [PSCustomObject]@{ Path = "ndk\$ndkVersion\source.properties"; Package = "ndk;$ndkVersion" },
+        [PSCustomObject]@{ Path = "cmake\$cmakeVersion\bin\cmake.exe"; Package = "cmake;$cmakeVersion" }
     )
     return @($requirements | Where-Object {
         -not (Test-Path -LiteralPath (Join-Path $SdkRoot $_.Path))
@@ -314,6 +321,14 @@ function Select-QuestDevice {
     $script:Serial = $devices[$parsed - 1]
 }
 
+function Assert-UpdateInstalled {
+    $arguments = Get-AdbArguments @("shell", "pm", "path", "com.miamivr.quest")
+    $installedPackage = & $script:adb @arguments
+    if ($LASTEXITCODE -ne 0 -or ($installedPackage | Out-String) -notmatch '(?m)^package:') {
+        throw "Update-only mode requires Vice City VR already installed. Use BUILD_AND_INSTALL for the first installation."
+    }
+}
+
 function Resolve-GameFolder {
     param([string]$Requested, [switch]$Required)
     if ([string]::IsNullOrWhiteSpace($Requested)) {
@@ -345,8 +360,14 @@ function Find-ChildDirectory {
 }
 
 try {
-    Write-Host "Vice City VR v0.5.1 - personal Quest build wizard" -ForegroundColor Green
+    $versionFile = Join-Path $repoRoot "overlay/android/app/build.gradle.kts"
+    $versionMatch = [regex]::Match((Get-Content -Raw -LiteralPath $versionFile), '(?m)^\s*versionName\s*=\s*"([0-9.]+)"\s*$')
+    if (-not $versionMatch.Success) { throw "Cannot read the source kit versionName." }
+    Write-Host "Vice City VR $($versionMatch.Groups[1].Value) - personal Quest build wizard" -ForegroundColor Green
     Write-Host "This repository supplies source/build tooling only; no APK or GTA data is bundled."
+    if ($UpdateOnly -and (Test-Path -LiteralPath (Join-Path $repoRoot "tools/update-required-assets.txt"))) {
+        throw "This release requires updated bundled assets. Run the normal BUILD_AND_INSTALL separately and follow its asset instructions; UPDATE does not copy assets."
+    }
 
     Write-Step 1 "Preparing Git, JDK 21 and the Android SDK"
     $gitExe = Find-Git
@@ -443,16 +464,18 @@ try {
         throw "Gradle extraction did not create $gradle"
     }
 
-    Write-Step 6 "Building the personal debug-signed APK"
+    $buildVariant = if ($Release) { "release" } else { "debug" }
+    $buildTask = if ($Release) { ":app:assembleRelease" } else { ":app:assembleDebug" }
+    Write-Step 6 "Building the personal $buildVariant-signed APK"
     Push-Location (Join-Path $assembledDir "android")
     try {
         Invoke-Checked -FilePath $gradle -Arguments @(
-            ":app:assembleDebug", "--no-daemon"
+            $buildTask, "--no-daemon"
         ) -FailureMessage "Android/ARM64 build failed"
     } finally {
         Pop-Location
     }
-    $apk = Join-Path $assembledDir "android\app\build\outputs\apk\debug\app-debug.apk"
+    $apk = Join-Path $assembledDir "android\app\build\outputs\apk\$buildVariant\app-$buildVariant.apk"
     if (-not (Test-Path -LiteralPath $apk -PathType Leaf)) {
         throw "Build completed without the expected APK: $apk"
     }
@@ -470,6 +493,7 @@ try {
     Write-Step 7 "Installing on the connected Quest"
     Select-QuestDevice
     Write-Host "Quest: $Serial"
+    if ($UpdateOnly) { Assert-UpdateInstalled }
     $installArguments = Get-AdbArguments @("install", "-r", $apk)
     $savedErrorPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -483,6 +507,9 @@ try {
     if ($installExitCode -ne 0) {
         $installText = $installOutput | Out-String
         if ($installText -match 'INSTALL_FAILED_UPDATE_INCOMPATIBLE') {
+            if ($UpdateOnly) {
+                throw "The installed app uses a different signing key. UPDATE left it and its data intact. Build with the same personal key/computer used for the installed version; no uninstall was attempted."
+            }
             Write-Host ""
             Write-Host "The Quest already contains Vice City VR signed with a different key." -ForegroundColor Yellow
             Write-Host "Android cannot update it in place." -ForegroundColor Yellow
@@ -508,9 +535,13 @@ try {
             $script:replacedIncompatibleInstall = $true
             Write-Host "The incompatible app was removed and the new APK was installed." -ForegroundColor Green
         } else {
+            if ($UpdateOnly -and $installText -match 'INSTALL_FAILED_VERSION_DOWNGRADE') {
+                throw "The Quest has a newer app. UPDATE will not downgrade it. Wait for the corresponding source release."
+            }
             throw "APK installation failed (exit code $installExitCode)."
         }
     }
+    if (-not $UpdateOnly) {
     $providerArguments = Get-AdbArguments @(
         "shell", "content", "query", "--uri", $saveProviderUri,
         "--projection", "_display_name:_size"
@@ -598,6 +629,9 @@ try {
         Invoke-AdbChecked -Arguments @(
             "push", (Join-Path $handsSource $name), "$handsRemote/$name"
         ) -FailureMessage "Failed to copy VR hand asset $name"
+    }
+    } else {
+        Write-Step 8 "APK updated; existing game data, saves, settings and bundled assets were left unchanged"
     }
     Invoke-AdbChecked -Arguments @("shell", "am", "force-stop", "com.miamivr.quest") `
         -FailureMessage "Could not leave the app stopped after installation"

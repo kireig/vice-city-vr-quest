@@ -13,6 +13,7 @@
 #include "platform.h"
 #include "skeleton.h"
 #include "android.h"
+#include "VrVehicleSeatRecenter.h"
 #include "xr_vulkan_session.h"
 
 #include "main.h"
@@ -70,6 +71,8 @@ size_t _dwMemAvailPhys;
 
 static bool gRwInitialised = false;
 static bool gForegroundApp = true;
+static VrVehicleSeatRecenter gVehicleSeatRecenter;
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
 static uint32 gQuestQuickStartSkipFrames;
 static uint32 gQuestQuickStartPlayableFrames;
 static bool gQuestQuickStartCutsceneSkipIssued;
@@ -158,6 +161,8 @@ AdvanceQuestQuickStartIntroSkip(void)
 		gQuestQuickStartTimeScaleOwned = false;
 	}
 }
+
+#endif
 
 // ---------------------------------------------------------------------------
 // ps* interface
@@ -759,6 +764,35 @@ SyncRenderWareCameraToVrView(void)
 	}
 }
 
+static void
+UpdateQuestVehicleSeatRecenter(CPlayerPed *player, bool seatReady, bool postPhysics)
+{
+	CVehicle *vehicle = player != nil && player->InVehicle() ?
+		player->m_pMyVehicle : nil;
+	int seat = -1;
+	if(vehicle != nil){
+		if(vehicle->pDriver == player)
+			seat = 0;
+		else
+			for(int i = 0; i < (int)ARRAY_SIZE(vehicle->pPassengers); i++)
+				if(vehicle->pPassengers[i] == player){
+					seat = i+1;
+					break;
+				}
+	}
+	if(gVehicleSeatRecenter.Update(player, vehicle, seat, seatReady,
+	   postPhysics, xrvk::hasTrackedGameplayHeadPose())){
+		// A basis-mode change alone can latch a stale XR position and misses
+		// seat changes that retain that mode. Relatch once at a completed seat
+		// with fresh tracking, then apply the ordinary calibrated anchor below.
+		// Subsequent leaning and wheel grabs keep their basis.
+		androidgame::VrRecenterView();
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
+		ALOG("vehicle seat recentered model=%d seat=%d", vehicle->GetModelIndex(), seat);
+#endif
+	}
+}
+
 // Decides whether this frame plays from inside the character's head and, if
 // so, anchors the view there. Menus, cutscenes and widescreen sequences keep
 // the regular camera anchor -- they are flat content and the cinema treatment
@@ -841,6 +875,12 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 	gVrInVehicle = wantFirstPerson && player->InVehicle() &&
 		player->m_pMyVehicle != nil &&
 		!thirdPersonVehicle;
+	UpdateQuestVehicleSeatRecenter(player,
+		gVrInVehicle && !vehicleTransition && playerVehicleState == PED_DRIVING &&
+		!FrontEndMenuManager.m_bGameNotLoaded && !FrontEndMenuManager.m_bWantToRestart &&
+		!FrontEndMenuManager.m_bWantToLoad && !androidgame::VrMenuConsumesInput() &&
+		player->m_rwObject != nil && !player->DyingOrDead() &&
+		player->m_pFrames[PED_HEAD] != nil, postPhysics);
 	// Match the desktop policy: DEFAULT driving uses the original animated
 	// vehicle occupant, while on-foot VR and IMMERSIVE/MOTION driving replace
 	// Tommy with tracked hands.  CRenderer and CPed both consume this flag, so
@@ -1548,6 +1588,7 @@ PrepareFrontendBeforeFrames(void)
 	}
 
 	if(gGameState == GS_INIT_FRONTEND){
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
 		if(QuestQuickTestStartEnabled()){
 			ALOG("quick test start: bypassing frontend and starting a new game");
 			LoadingScreen(nil, nil, "loadsc0");
@@ -1566,6 +1607,7 @@ PrepareFrontendBeforeFrames(void)
 			gQuestQuickStartTimeScaleOwned = false;
 			return true;
 		}
+#endif
 		LoadingScreen(nil, nil, "loadsc0");
 		FrontEndMenuManager.m_bGameNotLoaded = true;
 		FrontEndMenuManager.m_bStartUpFrontEndRequested = true;
@@ -1653,6 +1695,7 @@ Step(void)
 	// continuing the current state machine. Mirrors the desktop skeleton's
 	// handling of the same flag.
 	if(FrontEndMenuManager.m_bWantToRestart){
+		gVehicleSeatRecenter.Reset();
 		ALOG("restart requested (load=%d, firstTime=%d)",
 		     (int)FrontEndMenuManager.m_bWantToLoad,
 		     (int)FrontEndMenuManager.m_bFirstTime);
@@ -1746,15 +1789,19 @@ Step(void)
 		break;
 
 	case GS_PLAYING_GAME:
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
 		SkipQuestQuickStartCutsceneIfNeeded();
+#endif
 		// No frame limiter: xrWaitFrame already paces the application to the
 		// headset's refresh rate, and a second limiter on top of it only adds
 		// judder.
 		RsEventHandler(rsIDLE, (void*)TRUE);
+#if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
 		// The script may have created the cutscene inside this very idle step.
 		// Mark it skipped before the following submitted frame can present it.
 		SkipQuestQuickStartCutsceneIfNeeded();
 		AdvanceQuestQuickStartIntroSkip();
+#endif
 		// Rendering ran on the eye fov; game logic keeps the original.
 		::VrRestoreFov();
 		break;

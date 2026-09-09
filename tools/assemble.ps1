@@ -82,6 +82,64 @@ if ($LASTEXITCODE -ne 0) {
     Pop-Location
     Write-Error "The runtime v8 patch did not apply after the runtime v7 patch."
 }
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v9.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v9 patch did not apply after the runtime v8 patch."
+}
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v10.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v10 patch did not apply after the runtime v9 patch."
+}
+
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v11.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v11 patch did not apply after the runtime v10 patch."
+}
+
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v12.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v12 patch did not apply after the runtime v11 patch."
+}
+
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v13.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v13 patch did not apply after the runtime v12 patch."
+}
+
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v14.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v14 patch did not apply after the runtime v13 patch."
+}
+
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v15.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v15 patch did not apply after the runtime v14 patch."
+}
+
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v16.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v16 patch did not apply after the runtime v15 patch."
+}
+
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v17.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v17 patch did not apply after the runtime v16 patch."
+}
+
+git apply --whitespace=nowarn (Join-Path $repo "patches\revc-quest-runtime-v18.patch")
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    Write-Error "The runtime v18 patch did not apply after the runtime v17 patch."
+}
 Remove-Item -Recurse -Force (Join-Path $Out ".git")
 Pop-Location
 

@@ -1,0 +1,354 @@
+--- a/src/entities/Physical.cpp
++++ b/src/entities/Physical.cpp
+@@ -40,18 +40,48 @@
+ int32 CPhysical::NumVrCollisionFlatSavedNodeVisits;
+ 
+ #if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-// Capture the original contact while its world point and receiver matrix
+-// still describe the collision pose. Native records retain only the normal,
+-// and deliberately use A's normal for both participants; deformation needs
+-// the actual inward direction for each receiver. OFF touches no mesh/state.
++// Every point in a manifold was generated from the same two poses. Native
++// response may roll B back after the first point, so retain those poses before
++// applying any response. This POD copies no matrices or vectors while OFF.
++struct VehicleDeformationCollisionContext {
++	bool active;
++	VehicleDeformation::CollisionPose poseA, poseB;
++	static void Capture(CEntity *entity, VehicleDeformation::CollisionPose &out) {
++		const CVector &right=entity->GetRight(), &forward=entity->GetForward();
++		const CVector &up=entity->GetUp(), &position=entity->GetPosition();
++		out.right[0]=right.x;out.right[1]=right.y;out.right[2]=right.z;
++		out.forward[0]=forward.x;out.forward[1]=forward.y;out.forward[2]=forward.z;
++		out.up[0]=up.x;out.up[1]=up.y;out.up[2]=up.z;
++		out.position[0]=position.x;out.position[1]=position.y;out.position[2]=position.z;
++	}
++	VehicleDeformationCollisionContext(CEntity *A, CEntity *B)
++		: active(VehicleDeformation::IsVehicleDeformationEnabled() &&
++			!A->IsPed() && !B->IsPed() && (A->IsVehicle() || B->IsVehicle())) {
++		if(active) { Capture(A,poseA);Capture(B,poseB); }
++	}
++};
++
++// Normal points inward for A, and outward for B. These optional events are
++// independent of the native strongest damage record; the deformation module
++// already keeps one strongest pending impact per receiver.
+ static inline void
+ RecordVehicleDeformationCollision(CPhysical *receiver, CEntity *other,
+-	const CColPoint &point, float impulse, bool reverseNormal)
++	const CColPoint &point, float impulse, bool reverseNormal,
++	const VehicleDeformation::CollisionPose &pose)
+ {
+ 	if(VehicleDeformation::IsVehicleDeformationEnabled() && receiver->IsVehicle() &&
+ 	   ((CVehicle*)receiver)->IsCar() && !other->IsPed())
+ 		VehicleDeformation::RecordCollision((CVehicle*)receiver, point.point,
+-			reverseNormal ? -point.normal : point.normal, impulse, other);
++			reverseNormal ? -point.normal : point.normal, impulse, other, &pose);
++}
++
++static inline void
++RecordVehicleDeformationPair(const VehicleDeformationCollisionContext &context,
++	CPhysical *A, CPhysical *B, const CColPoint &point, float impulseA, float impulseB)
++{
++	if(!context.active) return;
++	RecordVehicleDeformationCollision(A,B,point,impulseA,false,context.poseA);
++	RecordVehicleDeformationCollision(B,A,point,impulseB,true,context.poseB);
+ }
+ 
+ namespace {
+@@ -1214,12 +1244,6 @@
+ 			}
+ 			if(!B->bInfiniteMass){
+ 				if(B->bIsInSafePosition){
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-					// The rollback changes B's matrix. Capture its contact first;
+-					// the equal-strength ordinary record keeps this earlier pose.
+-					if(impulseB > B->m_fDamageImpulse)
+-						RecordVehicleDeformationCollision(B, A, colpoint, impulseB, true);
+-#endif
+ 					B->UnsetIsInSafePosition();
+ 				}
+ 				B->ApplyMoveForce(fB);
+@@ -1795,24 +1819,24 @@
+ 	return false;
+ 
+ collision:
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++	VehicleDeformationCollisionContext deformationContext(A,B);
++#endif
+ 
+ 	if(A->bHasContacted && B->bHasContacted){
+ 		for(i = 0; i < numCollisions; i++){
+ 			if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 				continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			RecordVehicleDeformationPair(deformationContext,A,B,aColPoints[i],impulseA,impulseB);
++#endif
+ 
+ 			if(impulseA > A->m_fDamageImpulse){
+ 				A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-				RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 			}
+ 
+ 			if(impulseB > B->m_fDamageImpulse){
+ 				B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-				RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
+-#endif
+ 			}
+ 
+ 			float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+@@ -1830,19 +1854,16 @@
+ 		for(i = 0; i < numCollisions; i++){
+ 			if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 				continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			RecordVehicleDeformationPair(deformationContext,A,B,aColPoints[i],impulseA,impulseB);
++#endif
+ 
+ 			if(impulseA > A->m_fDamageImpulse){
+ 				A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-				RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 			}
+ 
+ 			if(impulseB > B->m_fDamageImpulse){
+ 				B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-				RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
+-#endif
+ 			}
+ 
+ 			float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+@@ -1871,19 +1892,16 @@
+ 		for(i = 0; i < numCollisions; i++){
+ 			if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 				continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			RecordVehicleDeformationPair(deformationContext,A,B,aColPoints[i],impulseA,impulseB);
++#endif
+ 
+ 			if(impulseA > A->m_fDamageImpulse){
+ 				A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-				RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 			}
+ 
+ 			if(impulseB > B->m_fDamageImpulse){
+ 				B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-				RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
+-#endif
+ 			}
+ 
+ 			float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+@@ -1906,19 +1924,16 @@
+ 		for(i = 0; i < numCollisions; i++){
+ 			if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 				continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++			RecordVehicleDeformationPair(deformationContext,A,B,aColPoints[i],impulseA,impulseB);
++#endif
+ 
+ 			if(impulseA > A->m_fDamageImpulse){
+ 				A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-				RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 			}
+ 
+ 			if(impulseB > B->m_fDamageImpulse){
+ 				B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-				RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
+-#endif
+ 			}
+ 
+ 			float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+@@ -2092,6 +2107,9 @@
+ 				numCollisions = A->ProcessEntityCollision(B, aColPoints);
+ 				if(numCollisions <= 0)
+ 					continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				VehicleDeformationCollisionContext deformationContext(A,B);
++#endif
+ 
+ 				CVector moveSpeed = CVector(0.0f, 0.0f, 0.0f);
+ 				CVector turnSpeed = CVector(0.0f, 0.0f, 0.0f);
+@@ -2101,6 +2119,9 @@
+ 					for(i = 0; i < numCollisions; i++){
+ 						if(!A->ApplyCollisionAlt(B, aColPoints[i], impulseA, moveSpeed, turnSpeed))
+ 							continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++						RecordVehicleDeformationPair(deformationContext,A,B,aColPoints[i],impulseA,impulseA);
++#endif
+ 
+ 						numResponses++;
+ 						if(impulseA > maxImpulseA) maxImpulseA = impulseA;
+@@ -2109,9 +2130,6 @@
+ 							if(!(((CVehicle*)A)->IsBoat() && aColPoints[i].surfaceB == SURFACE_WOOD_SOLID) &&
+ 							   impulseA > A->m_fDamageImpulse){
+ 								A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-								RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 							}
+ 
+ 							if(CSurfaceTable::GetAdhesionGroup(aColPoints[i].surfaceB) == ADHESIVE_SAND)
+@@ -2130,9 +2148,6 @@
+ 						}else{
+ 							if(impulseA > A->m_fDamageImpulse){
+ 								A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-								RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 							}
+ 
+ 							float turnSpeedDiff = A->m_vecTurnSpeed.MagnitudeSqr();
+@@ -2145,6 +2160,9 @@
+ 					for(i = 0; i < numCollisions; i++){
+ 						if(!A->ApplyCollisionAlt(B, aColPoints[i], impulseA, moveSpeed, turnSpeed))
+ 							continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++						RecordVehicleDeformationPair(deformationContext,A,B,aColPoints[i],impulseA,impulseA);
++#endif
+ 
+ 						numResponses++;
+ 						if(impulseA > maxImpulseA) maxImpulseA = impulseA;
+@@ -2155,9 +2173,6 @@
+ 								adhesion = 0.0f;
+ 							else if(impulseA > A->m_fDamageImpulse){
+ 								A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-								RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 							}
+ 
+ 							if(CSurfaceTable::GetAdhesionGroup(aColPoints[i].surfaceB) == ADHESIVE_SAND)
+@@ -2192,9 +2207,6 @@
+ 						}else{
+ 							if(impulseA > A->m_fDamageImpulse){
+ 								A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-								RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 							}
+ 
+ 							float turnSpeedDiff = A->m_vecTurnSpeed.MagnitudeSqr();
+@@ -2235,6 +2247,9 @@
+ 				numCollisions = A->ProcessEntityCollision(B, aColPoints);
+ 				if(numCollisions <= 0)
+ 					continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++				VehicleDeformationCollisionContext deformationContext(A,B);
++#endif
+ 
+ 				float maxImpulseA = 0.0f;
+ 				float maxImpulseB = 0.0f;
+@@ -2250,22 +2265,19 @@
+ 					for(i = 0; i < numCollisions; i++){
+ 						if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 							continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++						RecordVehicleDeformationPair(deformationContext,A,B,aColPoints[i],impulseA,impulseB);
++#endif
+ 
+ 						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
+ 						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+ 						if(impulseA > A->m_fDamageImpulse){
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-							RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 						}
+ 
+ 						if(impulseB > B->m_fDamageImpulse){
+ 							B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-							RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
+-#endif
+ 						}
+ 
+ 						float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+@@ -2283,22 +2295,19 @@
+ 					for(i = 0; i < numCollisions; i++){
+ 						if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 							continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++						RecordVehicleDeformationPair(deformationContext,A,B,aColPoints[i],impulseA,impulseB);
++#endif
+ 
+ 						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
+ 						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+ 						if(impulseA > A->m_fDamageImpulse){
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-							RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 						}
+ 
+ 						if(impulseB > B->m_fDamageImpulse){
+ 							B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-							RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
+-#endif
+ 						}
+ 
+ 						float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+@@ -2327,22 +2336,19 @@
+ 					for(i = 0; i < numCollisions; i++){
+ 						if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 							continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++						RecordVehicleDeformationPair(deformationContext,A,B,aColPoints[i],impulseA,impulseB);
++#endif
+ 
+ 						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
+ 						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+ 						if(impulseA > A->m_fDamageImpulse){
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-							RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 						}
+ 
+ 						if(impulseB > B->m_fDamageImpulse){
+ 							B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-							RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
+-#endif
+ 						}
+ 
+ 						float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();
+@@ -2365,22 +2371,19 @@
+ 					for(i = 0; i < numCollisions; i++){
+ 						if(!A->ApplyCollision(B, aColPoints[i], impulseA, impulseB))
+ 							continue;
++#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
++						RecordVehicleDeformationPair(deformationContext,A,B,aColPoints[i],impulseA,impulseB);
++#endif
+ 
+ 						if(impulseA > maxImpulseA){ maxImpulseA = impulseA; strongestPointA = i; }
+ 						if(impulseB > maxImpulseB){ maxImpulseB = impulseB; strongestPointB = i; }
+ 
+ 						if(impulseA > A->m_fDamageImpulse){
+ 							A->SetDamagedPieceRecord(aColPoints[i].pieceA, impulseA, B, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-							RecordVehicleDeformationCollision(A, B, aColPoints[i], impulseA, false);
+-#endif
+ 						}
+ 
+ 						if(impulseB > B->m_fDamageImpulse){
+ 							B->SetDamagedPieceRecord(aColPoints[i].pieceB, impulseB, A, aColPoints[i].normal);
+-#if defined(__ANDROID__) && defined(GTA_VR_WEAPONS)
+-							RecordVehicleDeformationCollision(B, A, aColPoints[i], impulseB, true);
+-#endif
+ 						}
+ 
+ 						float turnSpeedDiff = (B->m_vecTurnSpeed - A->m_vecTurnSpeed).MagnitudeSqr();

@@ -13,6 +13,9 @@
 #   --serial SERIAL       / -Serial SERIAL      Quest USB serial
 #   --hd-archive FILE     / -HdArchive FILE     pre-verified HD pack archive
 #   --mods-archive FILE   / -ModsArchive FILE   pre-verified Mods pack archive
+#   --xbox-archive FILE   / -XboxArchive FILE   pre-verified Xbox pack archive
+#   --xbox-only          / -XboxOnly           build only the Xbox vehicle profile
+#   --skip-xbox          / -SkipXbox           keep the original Modern-only route
 #   --build-only          / -BuildOnly          stop after building the overlay
 #   --accept-downloads    / -AcceptDownloads    skip the download confirmation
 #   --non-interactive     / -NonInteractive     never prompt; fail instead
@@ -27,12 +30,13 @@ ANDROID_SDK=""
 SERIAL=""
 HD_ARCHIVE=""
 MODS_ARCHIVE=""
+XBOX_ARCHIVE=""; SKIP_XBOX=0; XBOX_ONLY=0
 BUILD_ONLY=0
 ACCEPT_DOWNLOADS=0
 NON_INTERACTIVE=0
 LOG_PATH="${TMPDIR:-/tmp}/ViceCityVR-Prepare-Modern-Models.log"
 
-WIZARD_VERSION="0.5.1-models-3"
+WIZARD_VERSION="0.5.6-models-4"
 # The two externally hosted source packs used by the tested build.
 HD_URL="https://drive.usercontent.google.com/download?id=1Swe1dVWDnKz8ad51y8L0ihPWVCxmFRYj&export=download&confirm=t"
 MODS_URL="https://drive.usercontent.google.com/download?id=1y9KpKjLSna76bjz1Lf2DzP0G4AnkN_2d&export=download&confirm=t"
@@ -54,6 +58,9 @@ while [ $# -gt 0 ]; do
     --serial|-Serial)             SERIAL="$2"; shift 2 ;;
     --hd-archive|-HdArchive)      HD_ARCHIVE="$2"; shift 2 ;;
     --mods-archive|-ModsArchive)  MODS_ARCHIVE="$2"; shift 2 ;;
+    --xbox-archive|-XboxArchive) XBOX_ARCHIVE="$2"; shift 2 ;;
+    --skip-xbox|-SkipXbox) SKIP_XBOX=1; shift ;;
+    --xbox-only|-XboxOnly) XBOX_ONLY=1; shift ;;
     --build-only|-BuildOnly)          BUILD_ONLY=1; shift ;;
     --accept-downloads|-AcceptDownloads) ACCEPT_DOWNLOADS=1; shift ;;
     --non-interactive|-NonInteractive) NON_INTERACTIVE=1; shift ;;
@@ -312,11 +319,24 @@ echo "Vice City VR - download, build and install Modern models ($WIZARD_VERSION)
 echo "Required input: only a legal original GTA Vice City PC installation."
 echo "The wizard downloads two external packs used by the tested build; no pack is bundled or redistributed by this repository."
 echo "Modern vegetation/palms are deliberately excluded and remain Classic on Quest."
+echo "Xbox vehicles add a separate 35 MB download; --xbox-only builds just that profile, --skip-xbox keeps the two-pack Modern route."
 
 [ -f "$BUILDER" ] || die "Required source-kit tool is missing: $BUILDER"
 [ -f "$QUEST_INSTALLER" ] || die "Required source-kit tool is missing: $QUEST_INSTALLER"
 
-GAME="$(resolve_game_folder "$GAME_DIR")"
+GAME="$(resolve_game_folder "$GAME_DIR")" || die "Game folder validation failed; stopping."
+[ "$SKIP_XBOX" -eq 0 ] || [ "$XBOX_ONLY" -eq 0 ] || die "Choose either --skip-xbox or --xbox-only."
+XBOX_ARGS=(--game-dir "$GAME" --work-dir "$WORK_DIR")
+[ -z "$XBOX_ARCHIVE" ] || XBOX_ARGS+=(--xbox-archive "$XBOX_ARCHIVE")
+[ -z "$ANDROID_SDK" ] || XBOX_ARGS+=(--android-sdk "$ANDROID_SDK")
+[ -z "$SERIAL" ] || XBOX_ARGS+=(--serial "$SERIAL")
+[ "$ACCEPT_DOWNLOADS" -eq 0 ] || XBOX_ARGS+=(--accept-downloads)
+[ "$NON_INTERACTIVE" -eq 0 ] || XBOX_ARGS+=(--non-interactive)
+if [ "$XBOX_ONLY" -eq 1 ]; then
+  [ -z "$OUTPUT_DIR" ] || XBOX_ARGS+=(--output-dir "$OUTPUT_DIR")
+  [ "$BUILD_ONLY" -eq 0 ] || XBOX_ARGS+=(--build-only)
+  exec bash "$REPO_ROOT/tools/prepare-xbox-models.sh" "${XBOX_ARGS[@]}"
+fi
 mkdir -p "$WORK_DIR"
 WORK="$(cd "$WORK_DIR" && pwd)"
 if [ -z "$OUTPUT_DIR" ]; then
@@ -362,12 +382,16 @@ else
   MODS_SOURCE="$(ensure_extracted "Mods / Atmosphere" "$MODS_ZIP" "$SOURCES/mods-pack" "$MODS_SHA256")" || die "Mods / Atmosphere extraction failed; stopping before the build."
 
   echo "Building the optimized Quest Modern overlay. This can take several minutes..."
-  bash "$BUILDER" \
+  checked "Modern overlay build failed; no installation started" bash "$BUILDER" \
     --game-dir "$GAME" \
     --hd-pack "$HD_SOURCE" \
     --atmosphere-pack "$MODS_SOURCE" \
     --out "$OUTPUT" \
     --force
+fi
+
+if [ "$SKIP_XBOX" -eq 0 ]; then
+  checked "Xbox profile build failed; no model assets were installed" bash "$REPO_ROOT/tools/prepare-xbox-models.sh" "${XBOX_ARGS[@]}" --build-only
 fi
 
 if [ "$BUILD_ONLY" -eq 1 ]; then
@@ -388,6 +412,9 @@ rc=$?
 [ "$rc" -eq 0 ] || die "Quest Modern model installation failed (exit code $rc)."
 
 echo ""
+if [ "$SKIP_XBOX" -eq 0 ]; then
+  checked "Xbox profile installation failed; Modern is preserved" bash "$REPO_ROOT/tools/prepare-xbox-models.sh" "${XBOX_ARGS[@]}"
+fi
 echo "DOWNLOAD, BUILD AND QUEST INSTALL COMPLETED."
 echo "Fully restart Vice City VR. Modern World/Weapons are selected by default; Vehicles/Peds/Vegetation remain Classic."
 echo "Diagnostic log: $LOG_PATH"

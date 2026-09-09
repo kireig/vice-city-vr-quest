@@ -1,0 +1,207 @@
+--- a/src/control/CarAI.cpp
++++ b/src/control/CarAI.cpp
+@@ -42,7 +42,7 @@
+ void CCarAI::BackToCruisingIfNoWantedLevel(CVehicle* pVehicle)
+ {
+ 	if (FindPlayerPed()->m_pWanted->m_bIgnoredByEveryone || pVehicle->bIsLawEnforcer &&
+-		(FindPlayerPed()->m_pWanted->GetWantedLevel() == 0 || FindPlayerPed()->m_pWanted->m_bIgnoredByCops || CCullZones::NoPolice())) {
++		(FindPlayerPed()->m_pWanted->GetWantedLevel() == 0 || FindPlayerPed()->m_pWanted->IsIgnoredByCops() || CCullZones::NoPolice())) {
+ 		CCarCtrl::JoinCarWithRoadSystem(pVehicle);
+ 		pVehicle->AutoPilot.m_nCarMission = MISSION_CRUISE;
+ 		pVehicle->AutoPilot.m_nDrivingStyle = DRIVINGSTYLE_STOP_FOR_CARS;
+@@ -331,7 +331,7 @@
+ 				pVehicle->AutoPilot.m_nCarMission = MISSION_STOP_FOREVER;
+ 			}
+ 			if (distance > 70.0f || FindPlayerPed()->m_pWanted->m_bIgnoredByEveryone ||
+-				(FindPlayerPed()->m_pWanted->GetWantedLevel() == 0 || FindPlayerPed()->m_pWanted->m_bIgnoredByCops || CCullZones::NoPolice())) {
++				(FindPlayerPed()->m_pWanted->GetWantedLevel() == 0 || FindPlayerPed()->m_pWanted->IsIgnoredByCops() || CCullZones::NoPolice())) {
+ 				TellOccupantsToLeaveCar(pVehicle);
+ 				pVehicle->AutoPilot.m_nCruiseSpeed = 0;
+ 				pVehicle->AutoPilot.m_nCarMission = MISSION_STOP_FOREVER;
+--- a/src/core/Pad.cpp
++++ b/src/core/Pad.cpp
+@@ -720,6 +720,7 @@
+ 	VR_SPECIAL_RUN_WITHOUT_LIMITS,
+ 	VR_SPECIAL_OPEN_STORY_BRIDGES,
+ 	VR_SPECIAL_UNLOCK_SIX_STAR_WANTED_CAP,
++	VR_SPECIAL_NEVER_WANTED,
+ 	VR_SPECIAL_CHEAT_COUNT
+ };
+ 
+@@ -1093,6 +1094,10 @@
+ {
+ 	if(!enabled)
+ 		return false;
++	if(index == VR_SPECIAL_NEVER_WANTED){
++		*enabled = CWanted::bNoWantedCheat;
++		return true;
++	}
+ 	if(index == VR_SPECIAL_GOD_MODE){
+ 		*enabled = gVrGodModeEnabled;
+ 		return true;
+@@ -1284,6 +1289,9 @@
+ 			GetVrVehicleModelName(model));
+ 		return boatName;
+ 	}
++	if(index == VR_SPECIAL_NEVER_WANTED)
++		return CWanted::bNoWantedCheat ?
++			"NEVER WANTED - ON" : "NEVER WANTED - OFF";
+ 	if(index == VR_SPECIAL_GOD_MODE)
+ 		return gVrGodModeEnabled ?
+ 			"GOD MODE - ON" : "GOD MODE - OFF";
+@@ -1383,6 +1391,13 @@
+ 			ARRAY_SIZE(gVrCycleAirplaneModels)]);
+ 		gVrCycleAirplaneIndex = (gVrCycleAirplaneIndex+1)%
+ 			ARRAY_SIZE(gVrCycleAirplaneModels);
++		return true;
++	}
++	if(index == VR_SPECIAL_NEVER_WANTED){
++		CPlayerPed *player = FindPlayerPed();
++		if(!player || !player->m_pWanted)
++			return false;
++		player->m_pWanted->SetNoWantedCheat(!CWanted::bNoWantedCheat);
+ 		return true;
+ 	}
+ 	if(index == VR_SPECIAL_GOD_MODE){
+--- a/src/core/Wanted.cpp
++++ b/src/core/Wanted.cpp
+@@ -12,8 +12,21 @@
+ #include "General.h"
+ #include "Stats.h"
+ 
++bool CWanted::bNoWantedCheat = false;
+ int32 CWanted::MaximumWantedLevel = 6;
+ int32 CWanted::nMaximumWantedLevel = 9600;
++
++void
++CWanted::SetNoWantedCheat(bool enabled)
++{
++	bNoWantedCheat = enabled;
++	if (enabled) {
++		m_nMinChaos = 0;
++		m_nMinWantedLevel = 0;
++		SetWantedLevel(0);
++		ResetPolicePursuit();
++	}
++}
+ 
+ void
+ CWanted::Initialise()
+@@ -70,7 +83,7 @@
+ int32
+ CWanted::NumOfHelisRequired()
+ {
+-	if (m_bIgnoredByCops || m_bIgnoredByEveryone)
++	if (IsIgnored())
+ 		return 0;
+ 
+ 	switch (m_nWantedLevel) {
+@@ -200,6 +213,9 @@
+ bool
+ CWanted::AddCrimeToQ(eCrimeType type, int32 id, const CVector &coors, bool reported, bool policeDoesntCare)
+ {
++	// Ignore reports while enabled; they must not reappear after switching off.
++	if (bNoWantedCheat)
++		return true;
+ 	int i;
+ 
+ 	for(i = 0; i < 16; i++)
+@@ -228,6 +244,8 @@
+ void
+ CWanted::ReportCrimeNow(eCrimeType type, const CVector &coors, bool policeDoesntCare)
+ {
++	if (bNoWantedCheat)
++		return;
+ 	float sensitivity, chaos;
+ 	int wantedLevelDrop;
+ 
+@@ -310,6 +328,12 @@
+ void
+ CWanted::UpdateWantedLevel()
+ {
++	// Covers both crime reports and script/direct wanted-level requests.
++	if (bNoWantedCheat) {
++		m_nChaos = 0;
++		m_nMinChaos = 0;
++		m_nMinWantedLevel = 0;
++	}
+ 	int32 CurrWantedLevel = m_nWantedLevel;
+ 
+ 	if (m_nChaos > nMaximumWantedLevel)
+@@ -399,6 +423,13 @@
+ void
+ CWanted::Update(void)
+ {
++	if (bNoWantedCheat) {
++		// A loaded or newly-created player inherits the active session toggle.
++		SetWantedLevel(0);
++		if (m_CurrentCops > 0)
++			ResetPolicePursuit();
++		return;
++	}
+ 	if (CTimer::GetTimeInMilliseconds() > m_nLastTimeSuspended + 20000) {
+ 		m_nMinChaos = 0;
+ 		m_nMinWantedLevel = 0;
+--- a/src/core/Wanted.h
++++ b/src/core/Wanted.h
+@@ -29,6 +29,10 @@
+ 	CCrimeBeingQd m_aCrimes[16];
+ 	CCopPed *m_pCops[10];
+ 
++	// Session cheat, separate from serialized mission/garage flags and caps.
++	static bool bNoWantedCheat;
++	void SetNoWantedCheat(bool enabled);
++
+ 	static int32 MaximumWantedLevel;
+ 	static int32 nMaximumWantedLevel;
+ 
+@@ -56,7 +60,8 @@
+ 
+ 	void Suspend();
+ 
+-	bool IsIgnored(void) { return m_bIgnoredByCops || m_bIgnoredByEveryone; }
++	bool IsIgnoredByCops(void) { return m_bIgnoredByCops || bNoWantedCheat; }
++	bool IsIgnored(void) { return IsIgnoredByCops() || m_bIgnoredByEveryone; }
+ 
+ 	static int32 WorkOutPolicePresence(CVector posn, float radius);
+ 	static void SetMaximumWantedLevel(int32 level);
+--- a/src/peds/CopPed.cpp
++++ b/src/peds/CopPed.cpp
+@@ -287,7 +287,7 @@
+ 	CPlayerPed *aimPlayer = FindPlayerPed();
+ 	if (aimPlayer && IsPedInControl() && !m_bIsDisabledCop && !m_bZoneDisabled &&
+ 		(CharCreatedBy != MISSION_CHAR || bCrouchWhenScared) &&
+-		!aimPlayer->m_pWanted->m_bIgnoredByEveryone && !aimPlayer->m_pWanted->m_bIgnoredByCops &&
++		!aimPlayer->m_pWanted->m_bIgnoredByEveryone && !aimPlayer->m_pWanted->IsIgnoredByCops() &&
+ 		aimPlayer->m_pWanted->GetWantedLevel() < 2 && !CCullZones::NoPolice() &&
+ 		((CTimer::GetFrameCounter() + (uint8)m_randomSeed) & 3) == 0 &&
+ 		(GetPosition() - aimPlayer->GetPosition()).MagnitudeSqr2D() <= sq(15.0f)) {
+@@ -331,7 +331,7 @@
+ 	int wantedLevel = wanted->GetWantedLevel();
+ 	CPhysical *playerOrHisVeh = FindPlayerVehicle() ? (CPhysical*)FindPlayerVehicle() : (CPhysical*)FindPlayerPed();
+ 
+-	if (wanted->m_bIgnoredByEveryone || wanted->m_bIgnoredByCops) {
++	if (wanted->m_bIgnoredByEveryone || wanted->IsIgnoredByCops()) {
+ 		if (m_nPedState != PED_ARREST_PLAYER)
+ 			ClearPursuit();
+ 
+--- a/src/peds/PedAI.cpp
++++ b/src/peds/PedAI.cpp
+@@ -6377,7 +6377,7 @@
+ 	}
+ 	if (m_pedInObjective->IsPlayer()) {
+ 		CPlayerPed *player = FindPlayerPed();
+-		if (m_nPedType == PEDTYPE_COP && player->m_pWanted->m_bIgnoredByCops
++		if (m_nPedType == PEDTYPE_COP && player->m_pWanted->IsIgnoredByCops()
+ 			|| player->m_pWanted->m_bIgnoredByEveryone
+ 			|| m_pedInObjective->bIsInWater
+ 			|| m_pedInObjective->m_nPedState == PED_ARRESTED) {
+@@ -6658,7 +6658,7 @@
+ 	}
+ 	if (victimPlayer) {
+ 		CPlayerPed *player = FindPlayerPed();
+-		if (m_nPedType == PEDTYPE_COP && player->m_pWanted->m_bIgnoredByCops
++		if (m_nPedType == PEDTYPE_COP && player->m_pWanted->IsIgnoredByCops()
+ 			|| player->m_pWanted->m_bIgnoredByEveryone
+ 			|| m_pedInObjective->bIsInWater
+ 			|| m_pedInObjective->m_nPedState == PED_ARRESTED) {

@@ -409,7 +409,6 @@ struct MeleeMotion
 {
 	bool valid, armed;
 	int slot, weaponType;
-	bool usedContact;
 	CVector previousTip, previousRoot;
 	CVector previousTrackingTip, previousTrackingRoot;
 	uint32 previousFrame, lastStrikeTime, calmSince;
@@ -418,7 +417,6 @@ struct MeleeMotion
 	uint32 strikeContinueUntil;
 
 	MeleeMotion() : valid(false), armed(false), slot(-1), weaponType(-1),
-		usedContact(false),
 		previousFrame(0), lastStrikeTime(0), calmSince(0),
 		strikeInProgress(false), strikePeakSpeed(0.0f),
 		strikeContinueUntil(0)
@@ -1818,8 +1816,9 @@ static void
 UpdateWeaponTriggerEdges(bool blocked, uint32 blockedHands,
 	const androidgame::PadInput &input)
 {
+	const bool inVehicle = FindPlayerVehicle() != nil;
 	const bool vehicleWeaponButtonAvailable =
-		FindPlayerVehicle() && IsImmersiveDrivingActive();
+		inVehicle && IsImmersiveDrivingActive();
 	for(int hand = 0; hand < VR_HAND_COUNT; hand++){
 		const bool useVehicleWeaponButton =
 			vehicleWeaponButtonAvailable && gHeldSlot[hand] >= 0;
@@ -1827,7 +1826,7 @@ UpdateWeaponTriggerEdges(bool blocked, uint32 blockedHands,
 			(useVehicleWeaponButton ||
 			 (blockedHands & (1u << hand)) == 0) &&
 			gPoseValid[hand] &&
-			(useVehicleWeaponButton ? input.b :
+			(useVehicleWeaponButton ? input.b : !inVehicle &&
 			 (gTriggerPressed[hand] ? gTrigger[hand] >= 0.45f :
 			  gTrigger[hand] >= 0.55f));
 		gTriggerJustPressed[hand] =
@@ -2102,23 +2101,26 @@ UpdateMelee()
 		int slot = gHeldSlot[hand];
 		int weaponType = -1;
 		bool enabled = false;
-		bool usedContact = false;
 		CVector root, tip;
 		if(slot >= 0){
 			weaponType = GetVrWeaponTypeForSlot(slot);
 			enabled = IsPhysicalMelee(weaponType);
-			if(enabled && gWeaponContactSlot[hand] == slot &&
-			   gWeaponContactType[hand] == weaponType &&
-			   frame-gWeaponContactFrame[hand] <= 2U){
-				root = gWeaponContactMatrix[hand]*
-					MeleeModelRoot(weaponType);
-				tip = gWeaponContactMatrix[hand]*
-					MeleeModelTip(weaponType);
-				usedContact = true;
-			}else{
-				root = gGripMatrix[hand].GetPosition();
-				tip = root+gAimMatrix[hand].GetForward()*0.45f;
+			if(!enabled){
+				gMeleeMotion[hand] = MeleeMotion();
+				continue;
 			}
+			// Build the calibrated visible blade from this input sample. The
+			// render cache belongs to the previous frame and camera anchor; using
+			// it here both delays a hit and measures old world points against the
+			// new camera. Missing renders also used to shorten a katana to 45 cm.
+			CMatrix model;
+			WeaponCalibration *calibration = GetCalibration(hand, weaponType);
+			if(!calibration || !BuildWeaponModelMatrix(hand, *calibration, &model)){
+				gMeleeMotion[hand] = MeleeMotion();
+				continue;
+			}
+			root = model*MeleeModelRoot(weaponType);
+			tip = model*MeleeModelTip(weaponType);
 		}else{
 			slot = WEAPONSLOT_UNARMED;
 			weaponType = GetVrWeaponTypeForSlot(slot);
@@ -2136,13 +2138,16 @@ UpdateMelee()
 		MeleeMotion &motion = gMeleeMotion[hand];
 		if(!motion.valid || motion.slot != slot ||
 		   motion.weaponType != weaponType ||
-		   motion.usedContact != usedContact ||
-		   frame-motion.previousFrame > 2U || dt > 0.05f){
+		   frame-motion.previousFrame > 2U || dt > 0.10f){
 			motion = MeleeMotion();
 			motion.valid = true;
+			// The first sample establishes a baseline and never hits. Permit a
+			// deliberate swing on the next sample: requiring a perfectly calm
+			// long blade before its first hit could leave it disarmed forever
+			// when the player grabbed it directly into a series of swings.
+			motion.armed = true;
 			motion.slot = slot;
 			motion.weaponType = weaponType;
-			motion.usedContact = usedContact;
 			motion.previousRoot = root;
 			motion.previousTip = tip;
 			motion.previousTrackingRoot = trackingRoot;
@@ -2479,11 +2484,9 @@ ApplyTouchInput(CControllerState *state)
 		weaponStickHorizontal && input.rightStickX > 0.0f;
 	const uint32 vehicleCapturedHands =
 		UpdateQuestDrivingInput(state, menu || !gameplay);
-	const bool vehicleWeaponButtonConsumed =
-		gameplay && !menu && FindPlayerVehicle() &&
-		IsImmersiveDrivingActive() &&
-		(gHeldSlot[0] >= 0 || gHeldSlot[1] >= 0);
-	UpdateWeaponTriggerEdges(menu || !gameplay, vehicleCapturedHands, input);
+	const bool inVehicle = FindPlayerVehicle() != nil;
+	if(!inVehicle)
+		UpdateWeaponTriggerEdges(menu || !gameplay, vehicleCapturedHands, input);
 	UpdateTrackedDetonatorInput(menu || !gameplay);
 	// Quest has no in-vehicle magazine insertion path. Entering any vehicle
 	// makes ManualReloadAvailable false, which also clears an in-progress
@@ -2496,6 +2499,13 @@ ApplyTouchInput(CControllerState *state)
 		UpdateWeaponCalibrationSupportPreview();
 	else if(!gameplay)
 		ResetInteraction();
+	// A draw or holster can change which firing path owns B during this frame.
+	if(inVehicle)
+		UpdateWeaponTriggerEdges(menu || !gameplay, vehicleCapturedHands, input);
+	ApplyQuestVehicleButtonInput(state, menu || !gameplay);
+	const bool vehicleWeaponButtonConsumed =
+		gameplay && !menu && inVehicle && IsImmersiveDrivingActive() &&
+		(gHeldSlot[0] >= 0 || gHeldSlot[1] >= 0);
 	UpdateMelee();
 	UpdateScope();
 
